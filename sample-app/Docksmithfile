@@ -1,0 +1,14 @@
+FROM busybox:latest
+
+ENV APP_NAME=docksmith-sample
+ENV APP_ENV=production
+ENV GREETING=Hello
+
+WORKDIR /app
+
+COPY src/main.sh /app/main.sh
+COPY config/settings.txt /app/settings.txt
+
+RUN echo "build complete" > /app/message.txt
+
+CMD ["/bin/sh", "/app/main.sh"]

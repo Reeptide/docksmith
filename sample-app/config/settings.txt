@@ -1,0 +1,4 @@
+# Docksmith Sample App Settings
+version=1.0.0
+author=docksmith-demo
+description=A sample app to demonstrate all 6 Docksmithfile instructions
