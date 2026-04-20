@@ -1,0 +1,84 @@
+# DOCKSMITH COMPLETE DEMO SCRIPT
+# This script is designed for a live 15-minute viva/demo. 
+# Commands are separated so you can run them one by one and explain the architecture exactly as requested.
+
+# ---------------------------------------------------------
+# PRE-DEMO SETUP (Run this before you start screen sharing)
+# ---------------------------------------------------------
+# 1. Compile the tool and clear previous caches
+sudo make clean
+make build
+
+# 2. Import base images (Offline mode requirement)
+sudo ./setup/import-base-images.sh
+
+
+# ---------------------------------------------------------
+# LIVE DEMO STEPS (Run these one-by-one during the viva)
+# ---------------------------------------------------------
+
+# STEP 1: Cold Build (Demonstrating initial build and offline execution)
+# Talking point: "I am kicking off a cold build. Notice how every RUN and COPY step says [CACHE MISS]. The builder is hashing files, executing RUN commands inside a Linux Namespace, taking filesystem deltas, and saving them as content-addressed layers."
+sudo ./docksmith build -t myapp:latest ./sample-app
+
+
+# STEP 2: Warm Build (Demonstrating Cache Hit)
+# Talking point: "Now I'll run the exact same build. The cache key is calculated by hashing (Previous Digest + Instruction + WORKDIR + Sorted Env Vars + File hashes). Because nothing changed, we get a [CACHE HIT] instantly without re-executing."
+sudo ./docksmith build -t myapp:latest ./sample-app
+
+
+# STEP 3: Partial Cache Invalidation (Demonstrating cascading misses)
+# Talking point: "I will modify a config file. Only the steps AFTER the COPY instruction should miss the cache, because a cache miss legally cascades downwards."
+sudo sh -c 'echo "# modified for demo" >> sample-app/config/settings.txt'
+sudo ./docksmith build -t myapp:latest ./sample-app
+
+# (Cleanup the change to revert to clean state)
+sudo git restore sample-app/config/settings.txt
+
+
+# STEP 4: Image Verification
+# Talking point: "Let's check the local store. The image manifests are stored as JSON files where the name is derived from the SHA-256 digest of its canonical JSON."
+sudo ./docksmith images
+
+
+# STEP 5: Container Runtime Execution
+# Talking point: "Now I will run the container. Docksmith uses the 're-exec' pattern and Linux unshare (CLONE_NEWNS, CLONE_NEWPID). It constructs the root filesystem, chroots into it, and executes the app."
+sudo ./docksmith run myapp:latest
+
+
+# STEP 6: Environment Override
+# Talking point: "The instructions require us to allow -e flags to override image ENV variables at runtime. I will pass a new Greeting string."
+sudo ./docksmith run -e GREETING=Howdy myapp:latest
+
+
+# STEP 7: Isolation Pass/Fail Verification (Crucial for Demo marks!)
+# Talking point: "The hardest constraint is ensuring the container cannot write to the host system. I'll write a file to /tmp inside the container."
+sudo ./docksmith run myapp:latest /bin/sh -c 'echo SECRET > /tmp/escape-test.txt'
+
+# Verify the file DOES NOT exist on the host system:
+cat /tmp/escape-test.txt
+# (It should print "cat: /tmp/escape-test.txt: No such file or directory")
+
+
+# STEP 8: Cleanup and Teardown
+# Talking point: "Finally, 'rmi' will remove the image manifest and physically delete its content-addressed .tar delta files from the ~/.docksmith/layers directory."
+sudo ./docksmith rmi myapp:latest
+sudo ./docksmith images
+
+
+# ---------------------------------------------------------
+# VIVA CHEAT SHEET AND EXPLANATION HELPER
+# ---------------------------------------------------------
+# Use this to answer standard examiner questions:
+
+# Q: "How did you isolate the RUN command?"
+# A: "During a build, the RUN instruction creates a temporary rootfs, extracts the previous layers, and utilizes the exact same Linux namespace re-exec mechanism as 'docksmith run'. The parent 'build' process waits for the isolated child to finish, takes a hash of the modified files (snapshot delta), and bundles it into a layer."
+
+# Q: "How does the cache work precisely?"
+# A: "Before executing any COPY or RUN command, the engine strings together: The previous layer's digest hash, the exact string of the current instruction, the current WORKDIR, the sorted environment variables, and (for COPY) the sorted hashes of source files. It SHA-256 hashes this concatenated string. If it's found in the index.json, it skips executing."
+
+# Q: "Why was 'no networking' a hard constraint?"
+# A: "To force us to understand offline bundle construction. Base images are imported once during setup to ~/.docksmith/. Afterwards, the whole engine works by unpacking local tarballs, bypassing tools like Docker Hub."
+
+# Q: "What if an earlier layer modifies a file, and a later layer modifies it again?"
+# A: "Because layers are tar deltas extracted sequentially over each other, the later layer naturally overwrites the earlier file modification at the OS level during the rootfs assembly phase."
