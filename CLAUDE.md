@@ -1,0 +1,82 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+Docksmith is a simplified Docker-like build and container runtime built from scratch in Go — content-addressed image layers, a deterministic build cache, Linux process isolation via kernel namespaces + `pivot_root`, and container networking over hand-rolled rtnetlink. No dependency on Docker or runc, and **no external Go modules at all** (`go.mod` has no requires — keep it that way). Linux-only.
+
+## Commands
+
+```bash
+make build   # CGO_ENABLED=0 go build -o docksmith .
+make test    # go test ./... — needs no privileges
+make setup   # build + import busybox base image (one-time)
+make clean   # remove binary and state dir
+make demo    # full end-to-end verification (requires root)
+```
+
+`build`, `run`, and `RUN` steps require root (namespaces + `pivot_root`). Read-only commands (`images`, `ps`, `logs`, `prune`) do not.
+
+**`go build ./...` type-checks but does not write the executable.** If a CLI change appears to do nothing, `./docksmith` is stale — use `make build`.
+
+`CGO_ENABLED=0` is deliberate: `archive/tar` pulls in `os/user` → `runtime/cgo`, and a static binary is wanted for a container runtime.
+
+## Testing
+
+Unit tests cover everything that does not need privileges. They exist mainly to pin the determinism invariants the content-addressed store depends on: `store.BuildTar` must produce byte-identical output regardless of input order, host umask, or wall-clock time, and `cache.ComputeKey` must be stable across map iteration order while remaining sensitive to every input that can change a layer. Netlink message encoding is asserted at the byte level, including 4-byte attribute padding.
+
+`internal/runtime` has no unit coverage by design — it needs namespaces and root, and is verified by `make demo`.
+
+## Architecture
+
+### Re-exec: three sentinels
+
+There is no separate runtime binary and no daemon. `main.go` checks `os.Args[1]` **before any CLI parsing** for three sentinels — that ordering is load-bearing:
+
+- **`__child__`** — the container. Parent sets `SysProcAttr.Cloneflags` and passes a single JSON `ChildConfig` argument (it replaced positional args, which could not carry mounts or network settings). The child configures its network, sets up mounts, enters the rootfs, and runs the command.
+- **`__init__`** — container PID 1, *in-process*. `ChildMain` is already PID 1 inside the namespace, so it forks the real command as PID 2 and stays as init rather than exec'ing a separate binary. This is why no init binary is bind-mounted into the rootfs.
+- **`__supervisor__`** — `run -d`. Docksmith re-execs itself with `Setsid`, and that copy blocks in `IsolatedRun`, then writes the container's final state to `config.json`.
+
+### The FD protocol (`internal/runtime/isolate.go`)
+
+- **FD 3** — error pipe, child → parent. `CLOEXEC`, so a successful `exec` closes it and the parent reads EOF, signalling "setup succeeded". Setup failures are written as text.
+- **FD 4** — sync barrier, parent → child. The child blocks on one byte before doing anything, giving the parent a window for work needing the child to already exist (moving a veth endpoint by pid). **The byte is written in every mode** — a path that forgets hangs forever with no timeout.
+
+The parent must drain FD 3 **in a goroutine**. Reading it inline deadlocks: the read blocks until the child execs, and the child is blocked on FD 4 waiting for the parent.
+
+### Build pipeline (`internal/builder`)
+
+`parser.go` parses 7 instructions (`FROM`, `ENV`, `WORKDIR`, `EXPOSE`, `COPY`, `RUN`, `CMD`). `build.go` executes them against an assembled rootfs, producing one content-addressed delta layer per `COPY`/`RUN`. `RUN` deltas diff the post-execution rootfs against a re-extraction of the base layers, and `RUN` runs with `--net=none` — network access during a build would break cache determinism invisibly.
+
+`ignore.go` implements `.docksmithignore`, applied inside `collectGlob` so ignored files affect neither layer contents nor `COPY` cache keys.
+
+Cache keys (`internal/cache/cache.go`) are SHA-256 of: **a layer format version**, the previous layer digest, the instruction text, `WORKDIR`, accumulated `ENV` (sorted), and for `COPY` each source file's SHA-256 (sorted). **Bump `keyFormatVersion` whenever `BuildTar` output changes for the same inputs** — without it, layers built by older code are silently reused. `EXPOSE` is deliberately *not* in the key. **Cascade rule:** one miss forces all later steps to miss.
+
+### Storage (`internal/store`, `internal/image`)
+
+Layers are deterministic tars named by the SHA-256 of their bytes. Deletions are OCI-style whiteouts (`.wh.<name>`), and `BuildTar` writes whiteouts **ahead of all content** — lexical order is not sufficient, since `.cache` sorts before `.wh..cache`.
+
+`export.go` implements `save`/`load`; import verifies every layer hash and manifest digest before writing anything, so a corrupt archive leaves the store untouched.
+
+`rmi` and `prune` share `referencedLayers` (`cmd/rmi.go`) and delete only layers no surviving image references. Deleting unconditionally destroys shared base layers and every sibling image.
+
+### Runtime (`internal/runtime`)
+
+`mount.go` — `MS_REC|MS_PRIVATE` on `/` before any mount (required for `pivot_root`, and prevents leaking mounts to a systemd host), then `pivot_root`. Pre-pivot failures warn and fall back to `chroot`; **post-pivot failures are fatal**, since a failed unmount leaves the host filesystem readable at `/.oldroot`. Read-only bind mounts need a second `MS_BIND|MS_REMOUNT|MS_RDONLY` call — the kernel ignores flags on the first.
+
+`init.go` — PID 1 must handle signals explicitly: per `pid_namespaces(7)` a namespace's init only receives signals it has a handler for, even from an ancestor namespace, so an unhandled SIGTERM is discarded and `stop` degrades to SIGKILL after the full timeout. Uses `syscall.ForkExec`, never `os/exec`, whose internal reaper races the `Wait4(-1)` loop and eats the exit status.
+
+### Containers (`internal/container`)
+
+`~/.docksmith/containers/<id>/{config.json,rootfs/,container.log}`. Liveness compares **pid and `/proc/<pid>/stat` start time** — a bare pid check is reuse-unsafe and would let `stop` signal an unrelated process as root. `Reconcile` corrects records left claiming to run by a killed supervisor.
+
+### Networking (`internal/netlink`, `internal/network`)
+
+`internal/netlink` is a hand-rolled rtnetlink client: socket, sequence numbers, `NLMSG_ERROR` decoding, `rtattr` TLV encoding with nesting. Structs and constants come from stdlib `syscall`; only `IFLA_INFO_KIND`, `IFLA_INFO_DATA`, `VETH_INFO_PEER` are local. Payloads returned from a dump **must be copied** — they alias the receive buffer that the next `Recvfrom` overwrites.
+
+`internal/network` — `docksmith0` bridge, IPAM under a `flock`, DNS/hosts generation (loopback resolvers are filtered; systemd-resolved's `127.0.0.53` points at nothing inside a container). `nat.go` shells out to `iptables` and is the **only** external-binary dependency; it uses `-I` not `-A` because Docker's rules sit at the head of `FORWARD` with a `DROP` policy. Published ports need MASQUERADE for `127.0.0.0/8` sources plus `route_localnet`, or the container replies to its own loopback.
+
+### State root (`cmd/state.go`)
+
+`DOCKSMITH_ROOT` → `SUDO_USER`'s home → `$HOME`. `sudo` sets `HOME=/root`, so trusting `$HOME` would make `sudo docksmith run` and an unprivileged `docksmith ps` disagree about where state lives.

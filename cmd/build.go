@@ -4,7 +4,6 @@ import (
 	"docksmith/internal/builder"
 	"docksmith/internal/store"
 	"fmt"
-	"os"
 )
 
 func RunBuild(args []string) error {
@@ -44,12 +43,4 @@ func RunBuild(args []string) error {
 		NoCache:    noCache,
 		State:      st,
 	})
-}
-
-func stateRoot() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "/tmp/.docksmith"
-	}
-	return home + "/.docksmith"
 }

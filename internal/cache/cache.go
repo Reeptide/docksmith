@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 )
 
 // Index is the cache index file stored in cache/.
@@ -15,7 +16,10 @@ type Index struct {
 	Entries map[string]string `json:"entries"` // cacheKey -> layerDigest
 }
 
-const indexFile = "index.json"
+const (
+	indexFile = "index.json"
+	lockFile  = ".lock"
+)
 
 func loadIndex(cacheDir string) (*Index, error) {
 	path := filepath.Join(cacheDir, indexFile)
@@ -41,7 +45,48 @@ func saveIndex(cacheDir string, idx *Index) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(cacheDir, indexFile), data, 0644)
+	// Write to a temp file and rename, so an interrupted write cannot leave a
+	// truncated index behind — loadIndex would silently treat that as an empty
+	// cache and every subsequent build would miss.
+	path := filepath.Join(cacheDir, indexFile)
+	tmp, err := os.CreateTemp(cacheDir, indexFile+".tmp-*")
+	if err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), 0644); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
+}
+
+// lockIndex takes an exclusive flock on the cache directory, returning a
+// release function. Store is a read-modify-write of a single JSON file, so two
+// concurrent builds would otherwise each load the index, add their own entry,
+// and write back — with the second overwriting the first's entry. The lock
+// lives in its own file so it is never truncated by the index write itself.
+func lockIndex(cacheDir string) (func(), error) {
+	f, err := os.OpenFile(filepath.Join(cacheDir, lockFile), os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return func() {
+		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		f.Close()
+	}, nil
 }
 
 // Lookup checks the cache for a key. Returns layerDigest and true if found.
@@ -54,13 +99,57 @@ func Lookup(cacheDir, key string) (string, bool) {
 	return digest, ok
 }
 
-// Store writes a cache entry.
+// Store writes a cache entry, serialised against concurrent builds.
 func Store(cacheDir, key, layerDigest string) error {
+	unlock, err := lockIndex(cacheDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	// Load inside the lock: another build may have written entries since this
+	// process last read the index.
 	idx, err := loadIndex(cacheDir)
 	if err != nil {
 		return err
 	}
 	idx.Entries[key] = layerDigest
+	return saveIndex(cacheDir, idx)
+}
+
+// Keys returns the whole index as a copy: cache key -> layer digest. Used by
+// prune to find entries whose layer no longer exists.
+func Keys(cacheDir string) (map[string]string, error) {
+	idx, err := loadIndex(cacheDir)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(idx.Entries))
+	for k, v := range idx.Entries {
+		out[k] = v
+	}
+	return out, nil
+}
+
+// Delete removes cache entries, serialised against concurrent builds the same
+// way Store is.
+func Delete(cacheDir string, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	unlock, err := lockIndex(cacheDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	idx, err := loadIndex(cacheDir)
+	if err != nil {
+		return err
+	}
+	for _, k := range keys {
+		delete(idx.Entries, k)
+	}
 	return saveIndex(cacheDir, idx)
 }
 
@@ -73,9 +162,23 @@ type KeyParams struct {
 	FileSums    map[string]string // COPY only: path -> sha256
 }
 
+// keyFormatVersion salts every cache key with the layer format that produced
+// it. The key inputs describe the *instruction*, never the layer encoding, so
+// without this salt a change to how layers are built silently reuses layers
+// built by the old code: a RUN that deletes a file, cached before whiteout
+// support existed, recomputes an identical key afterwards, hits, and serves
+// the deletion-free layer forever behind a [CACHE HIT].
+//
+// Bump this whenever the bytes BuildTar emits for the same inputs change.
+//
+//	v2: whiteout entries added for deleted paths.
+const keyFormatVersion = "v2"
+
 // ComputeKey produces a deterministic cache key from KeyParams.
 func ComputeKey(p KeyParams) string {
 	var sb strings.Builder
+	sb.WriteString(keyFormatVersion)
+	sb.WriteByte('\n')
 	sb.WriteString(p.PrevDigest)
 	sb.WriteByte('\n')
 	sb.WriteString(p.Instruction)

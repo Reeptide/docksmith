@@ -39,6 +39,8 @@ type buildContext struct {
 	allCacheHit      bool
 	existingManifest *image.Manifest
 	startTime        time.Time
+	ignore           *IgnoreList
+	exposed          []string
 }
 
 // Build executes a Docksmithfile build.
@@ -52,6 +54,11 @@ func Build(opts BuildOptions) error {
 	name, tag := image.ParseNameTag(opts.Tag)
 	existing, _ := image.Load(opts.State.ImagesDir, name, tag)
 
+	ignore, err := LoadIgnoreList(opts.ContextDir)
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", IgnoreFileName, err)
+	}
+
 	bc := &buildContext{
 		opts:             opts,
 		name:             name,
@@ -61,6 +68,7 @@ func Build(opts BuildOptions) error {
 		allCacheHit:      true,
 		existingManifest: existing,
 		startTime:        time.Now(),
+		ignore:           ignore,
 	}
 
 	for i, instr := range instrs {
@@ -83,6 +91,8 @@ func (bc *buildContext) executeStep(stepNum int, instr Instruction) error {
 		return bc.execENV(stepNum, instr)
 	case InstrCMD:
 		return bc.execCMD(stepNum, instr)
+	case InstrEXPOSE:
+		return bc.execEXPOSE(stepNum, instr)
 	case InstrCOPY:
 		return bc.execCOPY(stepNum, instr)
 	case InstrRUN:
@@ -114,6 +124,7 @@ func (bc *buildContext) execFROM(stepNum int, instr Instruction) error {
 	if bc.workDir == "" && base.Config.WorkingDir != "" {
 		bc.workDir = base.Config.WorkingDir
 	}
+	bc.exposed = append(bc.exposed, base.Config.ExposedPorts...)
 	// Do NOT inherit base image CMD — spec requires explicit CMD.
 	bc.prevDigest = base.Digest
 	return nil
@@ -146,6 +157,29 @@ func (bc *buildContext) execCMD(stepNum int, instr Instruction) error {
 	return nil
 }
 
+func (bc *buildContext) execEXPOSE(stepNum int, instr Instruction) error {
+	fmt.Printf("Step %d/%d : EXPOSE %s\n", stepNum, bc.totalSteps, instr.Args)
+	ports, err := instr.AsEXPOSE()
+	if err != nil {
+		return err
+	}
+	for _, p := range ports {
+		if !contains(bc.exposed, p) {
+			bc.exposed = append(bc.exposed, p)
+		}
+	}
+	return nil
+}
+
+func contains(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
 func (bc *buildContext) execCOPY(stepNum int, instr Instruction) error {
 	t0 := time.Now()
 	instrText := "COPY " + instr.Args
@@ -155,7 +189,7 @@ func (bc *buildContext) execCOPY(stepNum int, instr Instruction) error {
 	}
 
 	// Collect sources.
-	srcFiles, err := collectGlob(bc.opts.ContextDir, parsed.Src)
+	srcFiles, err := collectGlob(bc.opts.ContextDir, parsed.Src, bc.ignore)
 	if err != nil {
 		return fmt.Errorf("line %d: COPY glob error: %w", instr.LineNum, err)
 	}
@@ -280,6 +314,13 @@ func (bc *buildContext) execRUN(stepNum int, instr Instruction) error {
 		WorkingDir:   bc.workDir,
 		Env:          copyEnvMap(bc.envMap),
 		EnvOverrides: nil,
+		// An empty network namespace: loopback only, no route out. Network
+		// access during a build would make layers depend on whatever a remote
+		// server returned at the time, which the cache has no way to detect —
+		// the same Docksmithfile would hit the cache and produce a different
+		// image. Everything a build needs must come from the context or a
+		// previous layer.
+		Network: &runtime.NetworkConfig{},
 	})
 
 	if runErr != nil {
@@ -338,9 +379,10 @@ func (bc *buildContext) assemble() error {
 		Tag:     bc.tag,
 		Created: createdTime,
 		Config: image.Config{
-			Env:        envSlice,
-			Cmd:        finalCmd,
-			WorkingDir: bc.workDir,
+			Env:          envSlice,
+			Cmd:          finalCmd,
+			WorkingDir:   bc.workDir,
+			ExposedPorts: bc.exposed,
 		},
 		Layers: bc.currentLayers,
 	}
@@ -371,6 +413,15 @@ func AssembleRootFS(m *image.Manifest, st *store.State) (string, error) {
 	return rootfs, nil
 }
 
+// AssembleRootFSInto extracts an image's layers into a caller-supplied
+// directory, for containers whose rootfs outlives the process that created it.
+func AssembleRootFSInto(m *image.Manifest, st *store.State, dest string) error {
+	if err := os.MkdirAll(dest, 0755); err != nil {
+		return err
+	}
+	return extractLayers(m.Layers, st, dest)
+}
+
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 type srcFile struct {
@@ -378,9 +429,9 @@ type srcFile struct {
 	RelPath  string
 }
 
-func collectGlob(contextDir, pattern string) ([]srcFile, error) {
+func collectGlob(contextDir, pattern string, ignore *IgnoreList) ([]srcFile, error) {
 	if strings.Contains(pattern, "**") {
-		return collectDoubleGlob(contextDir, pattern)
+		return collectDoubleGlob(contextDir, pattern, ignore)
 	}
 	matches, err := filepath.Glob(filepath.Join(contextDir, pattern))
 	if err != nil {
@@ -395,30 +446,48 @@ func collectGlob(contextDir, pattern string) ([]srcFile, error) {
 		}
 		if info.IsDir() {
 			err := filepath.WalkDir(m, func(path string, d fs.DirEntry, err error) error {
-				if err != nil || d.IsDir() {
+				if err != nil {
 					return err
 				}
 				r, _ := filepath.Rel(contextDir, path)
+				if ignore.Match(r) {
+					if d.IsDir() {
+						return filepath.SkipDir
+					}
+					return nil
+				}
+				if d.IsDir() {
+					return nil
+				}
 				out = append(out, srcFile{HostPath: path, RelPath: r})
 				return nil
 			})
 			if err != nil {
 				return nil, err
 			}
-		} else {
+		} else if !ignore.Match(rel) {
 			out = append(out, srcFile{HostPath: m, RelPath: rel})
 		}
 	}
 	return out, nil
 }
 
-func collectDoubleGlob(contextDir, pattern string) ([]srcFile, error) {
+func collectDoubleGlob(contextDir, pattern string, ignore *IgnoreList) ([]srcFile, error) {
 	var out []srcFile
 	err := filepath.WalkDir(contextDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+		if err != nil {
 			return err
 		}
 		rel, _ := filepath.Rel(contextDir, path)
+		if rel != "." && ignore.Match(rel) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
 		matched, _ := filepath.Match(strings.ReplaceAll(pattern, "**", "*"), rel)
 		if matched {
 			out = append(out, srcFile{HostPath: path, RelPath: rel})
@@ -542,16 +611,14 @@ func snapshotDelta(rootfs string, baseLayers []image.LayerEntry, st *store.State
 		if rel == "." {
 			return nil
 		}
-		// Skip virtual filesystems.
-		if rel == "proc" || strings.HasPrefix(rel, "proc/") ||
-			rel == "sys" || strings.HasPrefix(rel, "sys/") ||
-			rel == "dev" || strings.HasPrefix(rel, "dev/") {
+		if isVirtualPath(rel) {
 			return filepath.SkipDir
 		}
 
 		if d.IsDir() {
-			// Include new dirs in the delta.
-			if _, err := os.Stat(filepath.Join(refDir, rel)); os.IsNotExist(err) {
+			// Include new dirs in the delta. Lstat, not Stat: a symlink in the
+			// reference whose target is missing must still count as present.
+			if _, err := os.Lstat(filepath.Join(refDir, rel)); os.IsNotExist(err) {
 				if !dirsSeen[rel] {
 					tarFiles = append(tarFiles, store.TarFile{
 						Path:  rel + "/",
@@ -593,7 +660,65 @@ func snapshotDelta(rootfs string, baseLayers []image.LayerEntry, st *store.State
 		return nil, err
 	}
 
+	// Second walk, over the reference: anything present in the base layers but
+	// absent from the post-execution rootfs was deleted by this step, and must
+	// be recorded as a whiteout. Without this the delta only ever adds, so a
+	// RUN that removes a file produces a layer that deletes nothing and the
+	// file reappears when layers are reassembled.
+	err = filepath.WalkDir(refDir, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		rel, _ := filepath.Rel(refDir, p)
+		if rel == "." {
+			return nil
+		}
+		if isVirtualPath(rel) {
+			return filepath.SkipDir
+		}
+		// Lstat, not Stat: a busybox rootfs is mostly symlinks, and Stat would
+		// follow a link whose target is missing (or lives under a skipped
+		// prefix) and wrongly report the link itself as deleted.
+		if _, err := os.Lstat(filepath.Join(rootfs, rel)); err == nil {
+			return nil // still present
+		} else if !os.IsNotExist(err) {
+			return nil // unreadable for some other reason — do not guess
+		}
+		tarFiles = append(tarFiles, store.TarFile{
+			Path:       rel,
+			Mode:       0644,
+			IsWhiteout: true,
+		})
+		if d.IsDir() {
+			// One marker deletes the whole subtree on extraction, so there is
+			// no point enumerating what is underneath it.
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
 	return store.BuildTar(tarFiles)
+}
+
+// isVirtualPath reports whether a rootfs-relative path belongs to a kernel
+// filesystem mounted into the container rather than to image content. These
+// are never captured in a layer.
+func isVirtualPath(rel string) bool {
+	switch rel {
+	case "proc", "sys", "dev":
+		return true
+	case ".oldroot":
+		// Scratch mount point used by pivot_root. It is unmounted and removed
+		// before the command runs, but if a teardown ever fails it must not be
+		// captured into a layer.
+		return true
+	}
+	return strings.HasPrefix(rel, "proc/") ||
+		strings.HasPrefix(rel, "sys/") ||
+		strings.HasPrefix(rel, "dev/")
 }
 
 func copyEnvMap(m map[string]string) map[string]string {
