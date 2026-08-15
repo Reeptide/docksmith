@@ -108,7 +108,11 @@ func ruleExists(table, chain string, args []string) bool {
 // cannot route from. -I puts docksmith's accepts ahead of that.
 func ensureRule(table, chain string, args []string) (*Rule, error) {
 	if ruleExists(table, chain, args) {
-		return &Rule{Table: table, Chain: chain, Args: args}, nil
+		// Already present, and not ours to remove. Returning nil keeps it out
+		// of the caller's teardown list: recording a pre-existing rule would
+		// let this container's cleanup delete a rule another container
+		// installed, or one that a reallocated address made identical.
+		return nil, nil
 	}
 	full := append([]string{"-t", table, "-I", chain}, args...)
 	if err := iptables(full...); err != nil {
@@ -118,12 +122,16 @@ func ensureRule(table, chain string, args []string) (*Rule, error) {
 }
 
 // deleteRule removes a rule, ignoring the case where it is already gone.
+//
+// No -C probe first. iptables -C exits non-zero for both "rule absent" and
+// several unrelated errors, and under the nf_tables backend that ambiguity is
+// real — treating it as "absent" here would skip the delete and leak the rule
+// permanently. Attempting the delete and ignoring its failure is strictly
+// safer: the worst case is a no-op.
 func deleteRule(r Rule) error {
-	if !ruleExists(r.Table, r.Chain, r.Args) {
-		return nil
-	}
 	full := append([]string{"-t", r.Table, "-D", r.Chain}, r.Args...)
-	return iptables(full...)
+	_ = iptables(full...)
+	return nil
 }
 
 // EnsureNAT installs the host-wide rules containers need for outbound traffic.
@@ -162,11 +170,24 @@ func PublishPorts(containerIP string, ports []PortMapping) ([]Rule, error) {
 			args  []string
 		}{
 			// Traffic arriving from outside the host.
-			{"PREROUTING", []string{"-p", p.Protocol, "--dport", hostPort,
+			//
+			// --dst-type LOCAL restricts this to packets addressed to one of
+			// this host's own addresses. Without it the rule matches on
+			// destination port alone, so any traffic merely routed through this
+			// machine towards someone else's port 8080 is captured — and since
+			// EnsureBridge turns on ip_forward globally, that is real traffic.
+			// "! -i docksmith0" stops container-originated packets re-entering
+			// PREROUTING and being redirected back into the published container.
+			{"PREROUTING", []string{"!", "-i", BridgeName, "-p", p.Protocol,
+				"-m", "addrtype", "--dst-type", "LOCAL", "--dport", hostPort,
 				"-j", "DNAT", "--to-destination", dest}},
 			// Traffic originating on the host itself, including 127.0.0.1 —
-			// which is why route_localnet is enabled on the bridge.
-			{"OUTPUT", []string{"-p", p.Protocol, "--dport", hostPort,
+			// which is why route_localnet is enabled on the bridge. The same
+			// LOCAL restriction applies: otherwise every locally-originated
+			// connection to this port anywhere in the world is hijacked into
+			// the container.
+			{"OUTPUT", []string{"-p", p.Protocol,
+				"-m", "addrtype", "--dst-type", "LOCAL", "--dport", hostPort,
 				"-j", "DNAT", "--to-destination", dest}},
 		}
 		for _, s := range specs {
@@ -175,7 +196,9 @@ func PublishPorts(containerIP string, ports []PortMapping) ([]Rule, error) {
 				UnpublishPorts(installed)
 				return nil, fmt.Errorf("publishing %s: %w", p, err)
 			}
-			installed = append(installed, *rule)
+			if rule != nil {
+				installed = append(installed, *rule)
+			}
 		}
 
 		// Masquerade traffic that came from the host's loopback.
@@ -196,7 +219,9 @@ func PublishPorts(containerIP string, ports []PortMapping) ([]Rule, error) {
 			UnpublishPorts(installed)
 			return nil, fmt.Errorf("publishing %s: %w", p, err)
 		}
-		installed = append(installed, *snat)
+		if snat != nil {
+			installed = append(installed, *snat)
+		}
 
 		// Allow the forwarded traffic through to the container.
 		fwd, err := ensureRule("filter", "FORWARD", []string{
@@ -206,7 +231,9 @@ func PublishPorts(containerIP string, ports []PortMapping) ([]Rule, error) {
 			UnpublishPorts(installed)
 			return nil, fmt.Errorf("publishing %s: %w", p, err)
 		}
-		installed = append(installed, *fwd)
+		if fwd != nil {
+			installed = append(installed, *fwd)
+		}
 	}
 	return installed, nil
 }

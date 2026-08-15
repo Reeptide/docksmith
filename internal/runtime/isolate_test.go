@@ -2,8 +2,11 @@ package runtime
 
 import (
 	"encoding/json"
+	"os/exec"
 	"reflect"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // The child config crosses a process boundary as a single argv element, so it
@@ -100,5 +103,41 @@ func TestInitIsOnByDefault(t *testing.T) {
 	cfg = ChildConfig{UseInit: !RunOptions{NoInit: true}.NoInit}
 	if cfg.UseInit {
 		t.Error("NoInit should disable the init shim")
+	}
+}
+
+// A process killed by a signal has no exit code of its own: ExitCode() returns
+// -1, which reaches os.Exit as 255 and is recorded as "Exited (-1)". `stop`
+// escalating to SIGKILL takes this path on every forced stop.
+func TestExitStatusMapsSignalDeaths(t *testing.T) {
+	cmd := exec.Command("/bin/sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start helper: %v", err)
+	}
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		cmd.Process.Signal(syscall.SIGKILL)
+	}()
+	err := cmd.Wait()
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("expected an ExitError, got %v", err)
+	}
+	if exitErr.ExitCode() != -1 {
+		t.Skipf("platform reported %d rather than -1; nothing to map", exitErr.ExitCode())
+	}
+	if got := exitStatus(exitErr); got != 128+int(syscall.SIGKILL) {
+		t.Errorf("exitStatus = %d, want %d (128+SIGKILL)", got, 128+int(syscall.SIGKILL))
+	}
+}
+
+func TestExitStatusPassesOrdinaryExitCodesThrough(t *testing.T) {
+	err := exec.Command("/bin/sh", "-c", "exit 42").Run()
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("expected an ExitError, got %v", err)
+	}
+	if got := exitStatus(exitErr); got != 42 {
+		t.Errorf("exitStatus = %d, want 42", got)
 	}
 }

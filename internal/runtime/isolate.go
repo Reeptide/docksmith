@@ -199,11 +199,28 @@ func IsolatedRun(opts RunOptions) (int, error) {
 	}
 	if waitErr != nil {
 		if exitErr, ok := waitErr.(*exec.ExitError); ok {
-			return exitErr.ExitCode(), nil
+			return exitStatus(exitErr), nil
 		}
 		return 1, waitErr
 	}
 	return 0, nil
+}
+
+// exitStatus maps a finished process to a shell-style exit code.
+//
+// ExitError.ExitCode() returns -1 when a process was killed by a signal rather
+// than exiting, which is not a usable exit code: it reaches os.Exit as 255 and
+// is recorded in config.json as "Exited (-1)". `docksmith stop` escalating to
+// SIGKILL takes exactly this path. The init loop already reports 128+signal for
+// the command it supervises; this applies the same convention one level up.
+func exitStatus(e *exec.ExitError) int {
+	if ws, ok := e.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+		return 128 + int(ws.Signal())
+	}
+	if code := e.ExitCode(); code >= 0 {
+		return code
+	}
+	return 1
 }
 
 // ChildMain is the re-exec entry point. It performs namespace setup, enters the
