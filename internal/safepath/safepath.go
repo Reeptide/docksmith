@@ -27,10 +27,7 @@ import (
 // remaining components are appended, which is what makes this usable for paths
 // that are about to be created.
 func Resolve(root, rel string) (string, error) {
-	realRoot, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		realRoot = filepath.Clean(root)
-	}
+	realRoot := realRootOf(root)
 	target := filepath.Join(realRoot, filepath.Clean("/"+rel))
 
 	probe := target
@@ -83,11 +80,7 @@ func ResolveNoFollow(root, rel string) (string, error) {
 	}
 	full := filepath.Join(parent, base)
 
-	realRoot, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		realRoot = filepath.Clean(root)
-	}
-	if !within(realRoot, full) {
+	if !within(realRootOf(root), full) {
 		return "", fmt.Errorf("path %q escapes %s", rel, root)
 	}
 	return full, nil
@@ -135,6 +128,28 @@ func MkdirAll(root, rel string) (string, error) {
 		}
 	}
 	return target, nil
+}
+
+// realRootOf makes root absolute and then resolves it through symlinks, so
+// every path derived from it is comparable to every other by prefix.
+//
+// Absolutising first is load-bearing, and the order matters. A relative root
+// such as "." — which is what `docksmith build -t x .` passes as the build
+// context — otherwise stays relative through Join, so a contained result like
+// "payload.txt" fails a HasPrefix check against "./" and is reported as an
+// escape. EvalSymlinks alone does not fix it: EvalSymlinks(".") is ".", and it
+// would also leave any symlink in the current working directory unresolved,
+// so a caller that later compares against an absolute path disagrees.
+func realRootOf(root string) string {
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		abs = filepath.Clean(root)
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return abs
+	}
+	return resolved
 }
 
 // within reports whether path is root itself or lies beneath it.

@@ -146,3 +146,66 @@ func mustEval(t *testing.T, p string) string {
 	}
 	return real
 }
+
+// A relative root must behave exactly like the absolute path it names. The
+// build context is whatever the user typed on the command line, and "." is by
+// far the most common thing to type — `docksmith build -t x .` — so a
+// containment check that only works for absolute roots rejects ordinary,
+// entirely legitimate COPY sources. scripts/demo.sh always passes an absolute
+// context, which is why 59 end-to-end checks never exercised this.
+func TestResolveAcceptsARelativeRoot(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "payload.txt"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "sub", "deep"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sub", "deep", "n.txt"), []byte("y"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(cwd)
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, rel := range []string{"payload.txt", "sub/deep/n.txt", "missing.txt"} {
+		got, err := Resolve(".", rel)
+		if err != nil {
+			t.Errorf("Resolve(%q, %q) = error %v, want it contained", ".", rel, err)
+			continue
+		}
+		want, err := Resolve(dir, rel)
+		if err != nil {
+			t.Fatalf("Resolve(absolute, %q): %v", rel, err)
+		}
+		if got != want {
+			t.Errorf("Resolve(\".\", %q) = %q, absolute root gave %q", rel, got, want)
+		}
+	}
+
+	// Containment must still hold with a relative root.
+	if _, err := Resolve(".", "../outside.txt"); err != nil {
+		t.Errorf("../outside.txt is cleaned to the root, want no error, got %v", err)
+	}
+
+	for _, rel := range []string{"payload.txt", "sub/deep/n.txt"} {
+		got, err := ResolveNoFollow(".", rel)
+		if err != nil {
+			t.Errorf("ResolveNoFollow(%q, %q) = error %v, want it contained", ".", rel, err)
+			continue
+		}
+		want, err := ResolveNoFollow(dir, rel)
+		if err != nil {
+			t.Fatalf("ResolveNoFollow(absolute, %q): %v", rel, err)
+		}
+		if got != want {
+			t.Errorf("ResolveNoFollow(\".\", %q) = %q, absolute root gave %q", rel, got, want)
+		}
+	}
+}
