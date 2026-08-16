@@ -67,6 +67,8 @@ COPY src/main.sh /app/main.sh
 COPY config/settings.txt /app/settings.txt
 RUN echo built > /app/marker.txt
 RUN rm /bin/ls
+RUN ln -s /app/marker.txt /app/link-to-marker
+RUN rm /app/settings.txt && mkdir -p /app/settings.txt && echo nested > /app/settings.txt/inner
 CMD ["/bin/sh", "/app/main.sh"]
 EOF
 green "  ok"
@@ -100,6 +102,13 @@ inside "a file removed by RUN stays removed" bridge \
     '[ -e /bin/ls ] && echo FAILED || echo PASS'
 ok "base image is undamaged by the derived image's deletion" \
     ./docksmith run --rm busybox:latest /bin/ls /bin/ls
+
+inside "a symlink created by RUN is still a symlink in the image" bridge \
+    '[ -L /app/link-to-marker ] && echo PASS || echo FAILED'
+inside "  and it still points where it was made to point" bridge \
+    '[ "$(readlink /app/link-to-marker)" = /app/marker.txt ] && echo PASS || echo FAILED'
+inside "a file replaced by a directory reassembles as a directory" bridge \
+    '[ -d /app/settings.txt ] && [ "$(cat /app/settings.txt/inner)" = nested ] && echo PASS || echo FAILED'
 
 section "6. Isolation"
 inside "no /.oldroot leaked (pivot_root cleaned up)" bridge \

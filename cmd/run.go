@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
+	"sync/atomic"
+	"syscall"
 
 	"docksmith/internal/builder"
 	"docksmith/internal/container"
@@ -188,6 +191,23 @@ func runForeground(root string, rec *container.Record) error {
 	stdout, stopOut := teeToLog(os.Stdout, logFile)
 	stderr, stopErr := teeToLog(os.Stderr, logFile)
 
+	// Ctrl-C must not kill docksmith outright.
+	//
+	// The terminal sends SIGINT to the whole foreground process group, which
+	// contains both this process and the container. Under the default
+	// disposition docksmith dies first, so the IP lease is never released, the
+	// container's DNAT rules stay installed pointing at an address that is
+	// about to be handed to someone else, and the record is left claiming to be
+	// running. Catching the signal keeps this process alive long enough to run
+	// exactly the same teardown an ordinary exit runs.
+	//
+	// The signal is also forwarded explicitly, because a signal sent to this
+	// process alone (`kill` from a script, rather than a terminal) never
+	// reaches the container. A second signal escalates to SIGKILL, so an init
+	// that ignores SIGTERM cannot hold the terminal hostage.
+	var childPid atomic.Int64
+	stopSignals := forwardSignals(&childPid)
+
 	exitCode, runErr := runtime.IsolatedRun(runtime.RunOptions{
 		RootFS:     rec.RootFSPath(),
 		Command:    rec.Command,
@@ -205,11 +225,13 @@ func runForeground(root string, rec *container.Record) error {
 			if err := attachNetwork(root, rec, pid); err != nil {
 				return err
 			}
+			childPid.Store(int64(pid))
 			rec.MarkStarted(pid)
 			return container.Save(rec)
 		},
 	})
 
+	stopSignals()
 	stopOut()
 	stopErr()
 
@@ -236,6 +258,47 @@ func runForeground(root string, rec *container.Record) error {
 		os.Exit(exitCode)
 	}
 	return nil
+}
+
+// forwardSignals catches the signals that would otherwise kill docksmith while
+// a foreground container is running and relays them to the container instead.
+// The returned function stops the relay; it is safe to call exactly once.
+//
+// pid is read through an atomic because it is only known once the container has
+// been cloned, which happens on the caller's goroutine while this one is
+// already listening. Zero means "not started yet": the signal is dropped rather
+// than sent to process group 0, which would deliver it to docksmith itself and
+// every one of its siblings.
+func forwardSignals(pid *atomic.Int64) func() {
+	ch := make(chan os.Signal, 4)
+	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+
+	go func() {
+		var seen int
+		for s := range ch {
+			target := int(pid.Load())
+			if target <= 0 {
+				continue
+			}
+			seen++
+			sig := syscall.SIGKILL
+			if seen == 1 {
+				if unixSig, ok := s.(syscall.Signal); ok {
+					sig = unixSig
+				} else {
+					sig = syscall.SIGTERM
+				}
+			}
+			syscall.Kill(target, sig)
+		}
+	}()
+
+	return func() {
+		// Stop before close: after Notify has been undone no further sends can
+		// happen, so closing cannot race a delivery.
+		signal.Stop(ch)
+		close(ch)
+	}
 }
 
 // teeToLog returns a pipe whose writes reach both the terminal and the log

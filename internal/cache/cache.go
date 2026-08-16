@@ -172,7 +172,10 @@ type KeyParams struct {
 // Bump this whenever the bytes BuildTar emits for the same inputs change.
 //
 //	v2: whiteout entries added for deleted paths.
-const keyFormatVersion = "v2"
+//	v3: RUN deltas record symlinks as symlinks rather than copying their
+//	    targets, skip FIFOs and device nodes, whiteout entries whose kind
+//	    changed, and store permission bits only.
+const keyFormatVersion = "v3"
 
 // ComputeKey produces a deterministic cache key from KeyParams.
 func ComputeKey(p KeyParams) string {

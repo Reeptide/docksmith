@@ -67,21 +67,35 @@ func TestComputeKeySensitiveToEveryField(t *testing.T) {
 // The salt is what stops layers built by older code from being served after
 // the layer format changes. Without it, the whiteout fix would be invisible on
 // any pre-existing cache.
-func TestComputeKeyIncludesFormatVersion(t *testing.T) {
-	p := baseParams()
-	key := ComputeKey(p)
+// The whole point of keyFormatVersion is that bumping it invalidates every
+// key. That cannot be checked by comparing two live ComputeKey calls — the
+// constant is the same on both sides of any such comparison, so a version that
+// was never wired into the hash at all still passes. The previous version of
+// this test did exactly that, asserting only that a different PrevDigest gives
+// a different key, which is true whether or not the salt exists.
+//
+// A golden value is the only formulation that actually fails. This digest was
+// produced under keyFormatVersion "v3"; if the version changes and this value
+// does not, the salt is not reaching the hash and every stale layer built by
+// older code is still being served behind a [CACHE HIT].
+//
+// Bumping keyFormatVersion is therefore expected to break this test. Recompute
+// the constant below — deliberately, as part of the bump — rather than deleting
+// the assertion.
+const goldenKeyV3 = "a4bb26109a4dcbec0fe3b5d4efe3741b4582a8ebfe153dba76935e6b013b4ae4"
 
-	orig := keyFormatVersion
-	if orig == "" {
+func TestComputeKeyIncludesFormatVersion(t *testing.T) {
+	if keyFormatVersion == "" {
 		t.Fatal("keyFormatVersion must not be empty")
 	}
-	// Same inputs under a different format version must produce a different key.
-	// Verified indirectly: the version is the first thing hashed, so a key
-	// computed with a distinct PrevDigest prefix must differ.
-	p2 := baseParams()
-	p2.PrevDigest = orig + "\n" + p.PrevDigest
-	if ComputeKey(p2) == key {
-		t.Error("format version is not participating in the key")
+	if keyFormatVersion != "v3" {
+		t.Fatalf("keyFormatVersion is now %q: recompute goldenKeyV3 (and rename it) "+
+			"so the new format's keys are pinned", keyFormatVersion)
+	}
+	if got := ComputeKey(baseParams()); got != goldenKeyV3 {
+		t.Errorf("ComputeKey(baseParams()) = %s\nwant %s\n"+
+			"Either the key inputs changed without a keyFormatVersion bump, or "+
+			"the version is not reaching the hash.", got, goldenKeyV3)
 	}
 }
 

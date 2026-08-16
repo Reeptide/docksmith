@@ -96,13 +96,57 @@ func TestLookPathFallsBackToTheBareName(t *testing.T) {
 
 // UseInit is derived from NoInit, so the default must be "init on".
 func TestInitIsOnByDefault(t *testing.T) {
-	cfg := ChildConfig{UseInit: !RunOptions{}.NoInit}
-	if !cfg.UseInit {
+	if !childConfigFor(RunOptions{}, "/").UseInit {
 		t.Error("containers should run with an init by default")
 	}
-	cfg = ChildConfig{UseInit: !RunOptions{NoInit: true}.NoInit}
-	if cfg.UseInit {
+	if childConfigFor(RunOptions{NoInit: true}, "/").UseInit {
 		t.Error("NoInit should disable the init shim")
+	}
+}
+
+// The config crosses a process boundary as a single JSON argv element, so a
+// field the child needs but the parent never populates fails only at runtime,
+// inside a namespace, with the setup error arriving down FD 3.
+func TestChildConfigCarriesEveryOption(t *testing.T) {
+	opts := RunOptions{
+		RootFS:   "/var/lib/rootfs",
+		Command:  []string{"/bin/sh", "-c", "echo hi"},
+		Hostname: "abc123",
+		Mounts:   []Mount{{Source: "/srv", Target: "/data", ReadOnly: true}},
+		Network:  &NetworkConfig{Interface: "eth0", IP: "172.30.0.5/16", Gateway: "172.30.0.1"},
+	}
+	cfg := childConfigFor(opts, "/app")
+
+	if cfg.RootFS != opts.RootFS {
+		t.Errorf("RootFS = %q", cfg.RootFS)
+	}
+	if cfg.WorkDir != "/app" {
+		t.Errorf("WorkDir = %q, want the resolved working directory", cfg.WorkDir)
+	}
+	if len(cfg.Command) != len(opts.Command) {
+		t.Errorf("Command = %v", cfg.Command)
+	}
+	if cfg.Hostname != opts.Hostname {
+		t.Errorf("Hostname = %q", cfg.Hostname)
+	}
+	if len(cfg.Mounts) != 1 || cfg.Mounts[0].Target != "/data" || !cfg.Mounts[0].ReadOnly {
+		t.Errorf("Mounts = %+v", cfg.Mounts)
+	}
+	if cfg.Network == nil || cfg.Network.IP != opts.Network.IP {
+		t.Errorf("Network = %+v", cfg.Network)
+	}
+
+	// And it must survive the round trip that actually happens.
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back ChildConfig
+	if err := json.Unmarshal(data, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back.Network == nil || back.Network.IP != opts.Network.IP || !back.UseInit {
+		t.Errorf("config did not survive JSON: %+v", back)
 	}
 }
 

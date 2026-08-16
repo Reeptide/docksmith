@@ -85,6 +85,27 @@ type RunOptions struct {
 	OnStart func(pid int) error
 }
 
+// childConfigFor derives the child's configuration from the parent's options.
+//
+// Its own function so the derivation can be tested without cloning a namespace.
+// UseInit is the reason: it is the negation of NoInit, so the default is "init
+// on", and a test that rewrites that expression rather than calling this proves
+// nothing about what IsolatedRun actually sends. Getting the polarity wrong
+// would silently drop the init shim, which is what makes `stop` work at all —
+// per pid_namespaces(7) a PID 1 with no SIGTERM handler discards the signal, so
+// every stop would degrade to SIGKILL after the full timeout.
+func childConfigFor(opts RunOptions, workDir string) ChildConfig {
+	return ChildConfig{
+		RootFS:   opts.RootFS,
+		WorkDir:  workDir,
+		Command:  opts.Command,
+		Hostname: opts.Hostname,
+		UseInit:  !opts.NoInit,
+		Mounts:   opts.Mounts,
+		Network:  opts.Network,
+	}
+}
+
 // IsolatedRun executes a command inside rootfs using Linux namespaces.
 // Requires root: it uses CLONE_NEWNS/NEWPID/NEWUTS/NEWIPC and pivot_root.
 func IsolatedRun(opts RunOptions) (int, error) {
@@ -102,15 +123,7 @@ func IsolatedRun(opts RunOptions) (int, error) {
 		return 1, fmt.Errorf("cannot find executable: %w", err)
 	}
 
-	cfg := ChildConfig{
-		RootFS:   opts.RootFS,
-		WorkDir:  workDir,
-		Command:  opts.Command,
-		Hostname: opts.Hostname,
-		UseInit:  !opts.NoInit,
-		Mounts:   opts.Mounts,
-		Network:  opts.Network,
-	}
+	cfg := childConfigFor(opts, workDir)
 	cfgJSON, err := json.Marshal(cfg)
 	if err != nil {
 		return 1, fmt.Errorf("encoding child config: %w", err)

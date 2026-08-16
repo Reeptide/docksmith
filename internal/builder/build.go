@@ -527,7 +527,7 @@ func buildCopyTar(files []srcFile, dest, workDir string) ([]store.TarFile, error
 		archivePath = strings.TrimPrefix(filepath.Clean(archivePath), "/")
 
 		// Ensure parent directories exist in tar.
-		addParentDirs(archivePath, &tarFiles, destDirs)
+		addParentDirs(archivePath, &tarFiles, destDirs, nil)
 
 		tarFiles = append(tarFiles, store.TarFile{
 			Path:    archivePath,
@@ -539,7 +539,16 @@ func buildCopyTar(files []srcFile, dest, workDir string) ([]store.TarFile, error
 	return tarFiles, nil
 }
 
-func addParentDirs(archivePath string, tarFiles *[]store.TarFile, seen map[string]bool) {
+// addParentDirs emits directory entries for every ancestor of archivePath that
+// has not been emitted yet.
+//
+// existing, when non-nil, maps paths already present in the base layers to
+// their signature; an ancestor that is already an unchanged directory there is
+// skipped. Re-emitting it would be harmless for content but not for metadata:
+// the entry is written with mode 0755, so a delta layer would silently strip
+// the sticky bit from an inherited /tmp or downgrade any other directory mode
+// it merely happens to sit above.
+func addParentDirs(archivePath string, tarFiles *[]store.TarFile, seen map[string]bool, existing map[string]string) {
 	dir := filepath.Dir(archivePath)
 	if dir == "." || dir == "/" || dir == "" {
 		return
@@ -547,6 +556,9 @@ func addParentDirs(archivePath string, tarFiles *[]store.TarFile, seen map[strin
 	parts := strings.Split(strings.TrimPrefix(dir, "/"), "/")
 	for i := range parts {
 		d := strings.Join(parts[:i+1], "/")
+		if existing[d] == dirSig {
+			continue
+		}
 		if !seen[d] {
 			*tarFiles = append(*tarFiles, store.TarFile{
 				Path:  d + "/",
@@ -571,6 +583,55 @@ func extractLayers(layers []image.LayerEntry, st *store.State, rootfs string) er
 	return nil
 }
 
+// Signature prefixes. Every signature starts with one of these two-byte tags,
+// so comparing the first two bytes of two signatures compares their kind.
+const (
+	dirSig     = "d:"
+	symlinkSig = "l:"
+	regularSig = "f:"
+	otherSig   = "o:"
+)
+
+// entrySignature summarises a filesystem entry as a comparable string encoding
+// both its kind and its content, without ever following a symlink.
+//
+// Kind has to be part of it. The delta is computed by comparing the
+// post-execution rootfs against a re-extraction of the base layers, and a
+// content-only comparison cannot see a RUN that replaced a file with a
+// directory, or a directory with a symlink — cases where writing the new entry
+// over the old one at assembly time does not work.
+//
+// Symlinks are read with Readlink rather than followed. Reading through them,
+// which is what this used to do, turned every symlink a RUN step created into a
+// full copy of its target's bytes: a busybox image doing `ln -s /bin/busybox
+// /bin/ls` gained a megabyte per link and lost the indirection entirely.
+//
+// Anything that is neither a directory, a symlink, nor a regular file is
+// reported as otherSig and never opened. A FIFO is the reason: opening one for
+// reading blocks until a writer appears, which inside a build is never, so the
+// build hangs with no timeout and no diagnostic.
+func entrySignature(path string, d fs.DirEntry) (string, error) {
+	switch {
+	case d.IsDir():
+		return dirSig, nil
+	case d.Type()&fs.ModeSymlink != 0:
+		target, err := os.Readlink(path)
+		if err != nil {
+			return "", err
+		}
+		return symlinkSig + target, nil
+	case d.Type().IsRegular():
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "", err
+		}
+		h := sha256.Sum256(data)
+		return regularSig + hex.EncodeToString(h[:]), nil
+	default:
+		return otherSig, nil
+	}
+}
+
 // snapshotDelta builds a tar of files in rootfs that differ from the base layers.
 func snapshotDelta(rootfs string, baseLayers []image.LayerEntry, st *store.State) ([]byte, error) {
 	// Build a reference snapshot from base layers.
@@ -584,19 +645,21 @@ func snapshotDelta(rootfs string, baseLayers []image.LayerEntry, st *store.State
 		return nil, err
 	}
 
-	// Snapshot refDir file hashes.
-	refHashes := make(map[string]string)
-	_ = filepath.WalkDir(refDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return err
+	// Signature of every entry in the reference, keyed by rootfs-relative path.
+	refSigs := make(map[string]string)
+	_ = filepath.WalkDir(refDir, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
 		}
 		rel, _ := filepath.Rel(refDir, path)
-		data, err := os.ReadFile(path)
+		if rel == "." {
+			return nil
+		}
+		sig, err := entrySignature(path, d)
 		if err != nil {
 			return nil
 		}
-		h := sha256.Sum256(data)
-		refHashes[rel] = hex.EncodeToString(h[:])
+		refSigs[rel] = sig
 		return nil
 	})
 
@@ -615,45 +678,70 @@ func snapshotDelta(rootfs string, baseLayers []image.LayerEntry, st *store.State
 			return filepath.SkipDir
 		}
 
-		if d.IsDir() {
-			// Include new dirs in the delta. Lstat, not Stat: a symlink in the
-			// reference whose target is missing must still count as present.
-			if _, err := os.Lstat(filepath.Join(refDir, rel)); os.IsNotExist(err) {
-				if !dirsSeen[rel] {
-					tarFiles = append(tarFiles, store.TarFile{
-						Path:  rel + "/",
-						Mode:  0755,
-						IsDir: true,
-					})
-					dirsSeen[rel] = true
-				}
-			}
-			return nil
-		}
-
-		data, err := os.ReadFile(path)
+		sig, err := entrySignature(path, d)
 		if err != nil {
 			return nil
 		}
-		h := sha256.Sum256(data)
-		currentHash := hex.EncodeToString(h[:])
-
-		if refHash, exists := refHashes[rel]; exists && refHash == currentHash {
+		refSig, existed := refSigs[rel]
+		if existed && refSig == sig {
 			return nil // unchanged
 		}
 
-		// New or modified file — add parent dirs.
+		// A change of *kind* cannot be expressed by simply writing the new
+		// entry on top. Extraction would try to create a regular file where a
+		// directory from a lower layer already sits, or leave a stale directory
+		// shadowing a new symlink — either way the layer builds fine and then
+		// fails, or silently misbehaves, at assembly time. Whiteout first;
+		// BuildTar sorts every whiteout ahead of all content, so the removal is
+		// guaranteed to happen before the replacement is written.
+		if existed && refSig[:2] != sig[:2] {
+			tarFiles = append(tarFiles, store.TarFile{
+				Path:       rel,
+				Mode:       0644,
+				IsWhiteout: true,
+			})
+		}
+
 		info, _ := d.Info()
 		mode := int64(0644)
 		if info != nil {
-			mode = int64(info.Mode())
+			mode = int64(info.Mode().Perm())
 		}
-		addParentDirs(rel, &tarFiles, dirsSeen)
-		tarFiles = append(tarFiles, store.TarFile{
-			Path:    rel,
-			Mode:    mode,
-			Content: data,
-		})
+
+		switch {
+		case d.IsDir():
+			if !dirsSeen[rel] {
+				addParentDirs(rel, &tarFiles, dirsSeen, refSigs)
+				tarFiles = append(tarFiles, store.TarFile{
+					Path:  rel + "/",
+					Mode:  mode,
+					IsDir: true,
+				})
+				dirsSeen[rel] = true
+			}
+		case d.Type()&fs.ModeSymlink != 0:
+			addParentDirs(rel, &tarFiles, dirsSeen, refSigs)
+			tarFiles = append(tarFiles, store.TarFile{
+				Path:      rel,
+				Mode:      mode,
+				IsSymlink: true,
+				Linkname:  strings.TrimPrefix(sig, symlinkSig),
+			})
+		case d.Type().IsRegular():
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return nil
+			}
+			addParentDirs(rel, &tarFiles, dirsSeen, refSigs)
+			tarFiles = append(tarFiles, store.TarFile{
+				Path:    rel,
+				Mode:    mode,
+				Content: data,
+			})
+		default:
+			// FIFO, socket or device node. Not representable in a docksmith
+			// layer, and never read — see entrySignature.
+		}
 		return nil
 	})
 	if err != nil {

@@ -1,9 +1,15 @@
 package builder
 
 import (
+	"archive/tar"
+	"bytes"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"docksmith/internal/image"
 	"docksmith/internal/store"
@@ -210,4 +216,243 @@ func TestSnapshotDeltaDoesNotWhiteoutDanglingSymlinks(t *testing.T) {
 	if _, err := os.Lstat(filepath.Join(got, "bin/ls")); err != nil {
 		t.Errorf("dangling symlink was wrongly whited out: %v", err)
 	}
+}
+
+// A RUN that creates a symlink must produce a symlink in the layer.
+//
+// The delta walk used to read every entry with os.ReadFile, which follows
+// links, so `ln -s /bin/busybox /bin/ls` was recorded as a full copy of
+// busybox's bytes: the layer grew by the target's size per link and the
+// indirection was lost entirely, which for a busybox image means every applet
+// becomes an independent megabyte-sized binary.
+func TestSnapshotDeltaPreservesSymlinksCreatedByRun(t *testing.T) {
+	st := newTestState(t)
+	base := []image.LayerEntry{writeBaseLayer(t, st, []store.TarFile{
+		{Path: "bin/", Mode: 0755, IsDir: true},
+		{Path: "bin/busybox", Mode: 0755, Content: []byte("ELF-ish payload")},
+	})}
+
+	rootfs := t.TempDir()
+	if err := extractLayers(base, st, rootfs); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/bin/busybox", filepath.Join(rootfs, "bin/ls")); err != nil {
+		t.Fatal(err)
+	}
+
+	delta, err := snapshotDelta(rootfs, base, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := extractDelta(t, st, base, delta)
+	link := filepath.Join(got, "bin/ls")
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("bin/ls came back as a %v, not a symlink", info.Mode().Type())
+	}
+	target, err := os.Readlink(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != "/bin/busybox" {
+		t.Errorf("symlink target = %q, want /bin/busybox", target)
+	}
+}
+
+// A symlink inherited unchanged from the base must not appear in the delta at
+// all. Following it would hash the target's bytes, so any change to the target
+// would also rewrite every link pointing at it.
+func TestSnapshotDeltaIgnoresUnchangedSymlinks(t *testing.T) {
+	st := newTestState(t)
+	base := []image.LayerEntry{writeBaseLayer(t, st, []store.TarFile{
+		{Path: "bin/", Mode: 0755, IsDir: true},
+		{Path: "bin/busybox", Mode: 0755, Content: []byte("payload")},
+		{Path: "bin/sh", Mode: 0777, IsSymlink: true, Linkname: "/bin/busybox"},
+		{Path: "marker.txt", Mode: 0644, Content: []byte("x")},
+	})}
+
+	rootfs := t.TempDir()
+	if err := extractLayers(base, st, rootfs); err != nil {
+		t.Fatal(err)
+	}
+	// Touch something unrelated so the delta is non-empty for a real reason.
+	if err := os.WriteFile(filepath.Join(rootfs, "new.txt"), []byte("n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	delta, err := snapshotDelta(rootfs, base, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := tarEntryNames(t, delta)
+	for _, n := range names {
+		if n == "bin/sh" {
+			t.Errorf("unchanged symlink was re-recorded in the delta: %v", names)
+		}
+	}
+	if !containsName(names, "new.txt") {
+		t.Errorf("the genuinely new file is missing from the delta: %v", names)
+	}
+}
+
+// A FIFO left behind by a RUN step used to hang the build forever: os.ReadFile
+// on a FIFO blocks until a writer appears, which inside a finished build is
+// never, and there is no timeout anywhere in the pipeline.
+//
+// The test would hang rather than fail against the old code, so it runs the
+// snapshot on a goroutine and fails on a deadline instead.
+func TestSnapshotDeltaSkipsFIFOsInsteadOfBlocking(t *testing.T) {
+	st := newTestState(t)
+	base := []image.LayerEntry{writeBaseLayer(t, st, []store.TarFile{
+		{Path: "var/", Mode: 0755, IsDir: true},
+	})}
+
+	rootfs := t.TempDir()
+	if err := extractLayers(base, st, rootfs); err != nil {
+		t.Fatal(err)
+	}
+	fifo := filepath.Join(rootfs, "var/pipe")
+	if err := syscall.Mkfifo(fifo, 0644); err != nil {
+		t.Skipf("cannot create a FIFO here: %v", err)
+	}
+
+	type result struct {
+		data []byte
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		data, err := snapshotDelta(rootfs, base, st)
+		done <- result{data, err}
+	}()
+
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		if containsName(tarEntryNames(t, r.data), "var/pipe") {
+			t.Error("a FIFO was recorded in the layer; it is not representable")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("snapshotDelta blocked on a FIFO")
+	}
+}
+
+// A RUN that replaces a file with a directory (or the reverse) must whiteout
+// the old entry first. Without it the delta carries a directory entry for a
+// path that a lower layer still holds as a regular file, and assembly fails —
+// the build succeeds and the image is unusable.
+func TestSnapshotDeltaWhiteoutsTypeChanges(t *testing.T) {
+	cases := []struct {
+		name     string
+		base     []store.TarFile
+		mutate   func(t *testing.T, rootfs string)
+		checkDir bool // expect a directory at conf after reassembly
+	}{
+		{
+			name: "file becomes directory",
+			base: []store.TarFile{{Path: "conf", Mode: 0644, Content: []byte("old")}},
+			mutate: func(t *testing.T, rootfs string) {
+				p := filepath.Join(rootfs, "conf")
+				if err := os.Remove(p); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(p, 0755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(p, "a.txt"), []byte("a"), 0644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			checkDir: true,
+		},
+		{
+			name: "directory becomes file",
+			base: []store.TarFile{
+				{Path: "conf/", Mode: 0755, IsDir: true},
+				{Path: "conf/a.txt", Mode: 0644, Content: []byte("a")},
+			},
+			mutate: func(t *testing.T, rootfs string) {
+				p := filepath.Join(rootfs, "conf")
+				if err := os.RemoveAll(p); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(p, []byte("now a file"), 0644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			st := newTestState(t)
+			base := []image.LayerEntry{writeBaseLayer(t, st, c.base)}
+
+			rootfs := t.TempDir()
+			if err := extractLayers(base, st, rootfs); err != nil {
+				t.Fatal(err)
+			}
+			c.mutate(t, rootfs)
+
+			delta, err := snapshotDelta(rootfs, base, st)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			got := extractDelta(t, st, base, delta)
+			info, err := os.Lstat(filepath.Join(got, "conf"))
+			if err != nil {
+				t.Fatalf("conf is missing after reassembly: %v", err)
+			}
+			if info.IsDir() != c.checkDir {
+				t.Fatalf("conf came back as IsDir=%v, want %v", info.IsDir(), c.checkDir)
+			}
+			if c.checkDir {
+				if _, err := os.Stat(filepath.Join(got, "conf/a.txt")); err != nil {
+					t.Errorf("new directory contents missing: %v", err)
+				}
+			} else {
+				data, err := os.ReadFile(filepath.Join(got, "conf"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(data) != "now a file" {
+					t.Errorf("conf = %q", data)
+				}
+			}
+		})
+	}
+}
+
+// tarEntryNames lists the entry names in a layer, whiteout markers included.
+func tarEntryNames(t *testing.T, data []byte) []string {
+	t.Helper()
+	tr := tar.NewReader(bytes.NewReader(data))
+	var names []string
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, strings.TrimSuffix(hdr.Name, "/"))
+	}
+	return names
+}
+
+func containsName(names []string, want string) bool {
+	for _, n := range names {
+		if n == want {
+			return true
+		}
+	}
+	return false
 }

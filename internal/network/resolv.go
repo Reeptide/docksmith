@@ -3,6 +3,7 @@ package network
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -53,9 +54,18 @@ func hostNameservers() []string {
 		return nil
 	}
 	defer f.Close()
+	return parseNameservers(f)
+}
 
+// parseNameservers extracts the usable nameserver addresses from resolv.conf
+// syntax. Split out from hostNameservers so it can be tested against inputs
+// this host does not happen to have: the machine docksmith was written on runs
+// systemd-resolved and its /etc/resolv.conf contains nothing but 127.0.0.53, so
+// a test that read the real file would never exercise the non-loopback path —
+// or, on a host without systemd-resolved, never exercise the filter at all.
+func parseNameservers(r io.Reader) []string {
 	var out []string
-	scanner := bufio.NewScanner(f)
+	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) < 2 || fields[0] != "nameserver" {

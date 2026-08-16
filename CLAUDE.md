@@ -26,7 +26,9 @@ make demo    # full end-to-end verification (requires root)
 
 Unit tests cover everything that does not need privileges. They exist mainly to pin the determinism invariants the content-addressed store depends on: `store.BuildTar` must produce byte-identical output regardless of input order, host umask, or wall-clock time, and `cache.ComputeKey` must be stable across map iteration order while remaining sensitive to every input that can change a layer. Netlink message encoding is asserted at the byte level, including 4-byte attribute padding.
 
-`internal/runtime` has no unit coverage by design — it needs namespaces and root, and is verified by `make demo`.
+`internal/runtime`'s namespace work needs root and is verified by `make demo`; only the root-free parts (child-config derivation, exit-status mapping, mount-spec parsing) have unit tests.
+
+**Tests here are held to non-vacuity.** Several early ones asserted the buggy behaviour they were written to prevent, or rebuilt a production expression in the test and compared it to itself. When adding a test for a fix, break the fix and confirm the test fails before keeping it.
 
 ## Architecture
 
@@ -49,9 +51,11 @@ The parent must drain FD 3 **in a goroutine**. Reading it inline deadlocks: the 
 
 `parser.go` parses 7 instructions (`FROM`, `ENV`, `WORKDIR`, `EXPOSE`, `COPY`, `RUN`, `CMD`). `build.go` executes them against an assembled rootfs, producing one content-addressed delta layer per `COPY`/`RUN`. `RUN` deltas diff the post-execution rootfs against a re-extraction of the base layers, and `RUN` runs with `--net=none` — network access during a build would break cache determinism invisibly.
 
+The diff compares `entrySignature`, which encodes an entry's **kind as well as its bytes** and never follows a symlink. Kind matters because a path whose type changed cannot be fixed by writing the new entry over the old one, so a type change emits a whiteout first. Symlinks are read with `Readlink`, not through: following them turned every link a `RUN` created into a full copy of its target, which on a busybox rootfs is a megabyte per applet. FIFOs, sockets and device nodes are skipped without ever being opened — `os.ReadFile` on a FIFO blocks until a writer appears, so a stray FIFO hangs the build forever with no timeout.
+
 `ignore.go` implements `.docksmithignore`, applied inside `collectGlob` so ignored files affect neither layer contents nor `COPY` cache keys.
 
-Cache keys (`internal/cache/cache.go`) are SHA-256 of: **a layer format version**, the previous layer digest, the instruction text, `WORKDIR`, accumulated `ENV` (sorted), and for `COPY` each source file's SHA-256 (sorted). **Bump `keyFormatVersion` whenever `BuildTar` output changes for the same inputs** — without it, layers built by older code are silently reused. `EXPOSE` is deliberately *not* in the key. **Cascade rule:** one miss forces all later steps to miss.
+Cache keys (`internal/cache/cache.go`) are SHA-256 of: **a layer format version**, the previous layer digest, the instruction text, `WORKDIR`, accumulated `ENV` (sorted), and for `COPY` each source file's SHA-256 (sorted). **Bump `keyFormatVersion` whenever `BuildTar` output or `snapshotDelta`'s encoding changes for the same inputs** — without it, layers built by older code are silently reused. The bump is pinned by a golden digest in `cache_test.go`, which is *expected* to fail on a bump; recompute it deliberately rather than deleting the assertion. `EXPOSE` is deliberately *not* in the key. **Cascade rule:** one miss forces all later steps to miss.
 
 ### Storage (`internal/store`, `internal/image`)
 
@@ -70,6 +74,8 @@ Layers are deterministic tars named by the SHA-256 of their bytes. Deletions are
 ### Containers (`internal/container`)
 
 `~/.docksmith/containers/<id>/{config.json,rootfs/,container.log}`. Liveness compares **pid and `/proc/<pid>/stat` start time** — a bare pid check is reuse-unsafe and would let `stop` signal an unrelated process as root. `Reconcile` corrects records left claiming to run by a killed supervisor.
+
+A foreground `run` catches SIGINT/SIGTERM/SIGHUP rather than dying on them (`forwardSignals` in `cmd/run.go`). The terminal sends Ctrl-C to the whole foreground process group, so under the default disposition docksmith died before releasing the IP lease or deleting the container's DNAT rules — which then pointed at an address about to be reallocated. The signal is forwarded to the container explicitly, since a `kill` aimed at docksmith alone never reaches it; a second signal escalates to SIGKILL.
 
 ### Networking (`internal/netlink`, `internal/network`)
 
