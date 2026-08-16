@@ -411,19 +411,6 @@ func (bc *buildContext) assemble() error {
 	return nil
 }
 
-// AssembleRootFS extracts all image layers into a fresh temp dir.
-func AssembleRootFS(m *image.Manifest, st *store.State) (string, error) {
-	rootfs, err := os.MkdirTemp("", "docksmith-rootfs-*")
-	if err != nil {
-		return "", err
-	}
-	if err := extractLayers(m.Layers, st, rootfs); err != nil {
-		os.RemoveAll(rootfs)
-		return "", err
-	}
-	return rootfs, nil
-}
-
 // AssembleRootFSInto extracts an image's layers into a caller-supplied
 // directory, for containers whose rootfs outlives the process that created it.
 func AssembleRootFSInto(m *image.Manifest, st *store.State, dest string) error {

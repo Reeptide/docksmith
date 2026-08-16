@@ -60,6 +60,19 @@ func removeOne(root, ref string, force bool) error {
 		for i := 0; i < 50 && rec.IsAlive(); i++ {
 			time.Sleep(100 * time.Millisecond)
 		}
+		// Removing the record anyway would be the worst outcome: the container
+		// keeps running with nothing left that names its pid, its address or
+		// its iptables rules, so it can never be stopped or cleaned up by any
+		// docksmith command again. SIGKILL is unblockable, so surviving this
+		// means uninterruptible sleep — a wedged NFS mount or a stuck device —
+		// and the right answer is to say so and leave the record alone.
+		if rec.IsAlive() {
+			return fmt.Errorf("container %s did not die after SIGKILL; "+
+				"it is likely blocked in the kernel. Refusing to remove the "+
+				"record, which is all that still tracks it",
+				container.ShortID(rec.ID))
+		}
+		rec.MarkExited(137) // 128 + SIGKILL
 	}
 
 	// Release the address lease and delete the iptables rules recorded for

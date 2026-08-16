@@ -170,6 +170,11 @@ func RunContainer(args []string) error {
 		}
 	}
 	if err := container.Save(rec); err != nil {
+		// Same cleanup as every other failure between Create and start. Without
+		// it this path leaves a record stuck in "created" holding a rootfs and
+		// an IP lease that nothing will ever release.
+		teardownNetwork(root, rec)
+		container.Remove(rec)
 		return fmt.Errorf("run: %w", err)
 	}
 

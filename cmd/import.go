@@ -131,7 +131,12 @@ func collectDir(dir string) ([]store.TarFile, error) {
 		}
 		mode := int64(0644)
 		if info != nil {
-			mode = int64(info.Mode())
+			// TarMode, not int64(Mode()): Go's FileMode puts setuid, setgid and
+			// sticky in bits that do not match the Unix layout, so a raw
+			// conversion writes nonsense into the tar header. ExtractTar masks
+			// it back off so nothing breaks, but the layer bytes are wrong and
+			// the two import paths disagreed with snapshotDelta.
+			mode = store.TarMode(info.Mode())
 		}
 		files = append(files, store.TarFile{
 			Path:    rel,

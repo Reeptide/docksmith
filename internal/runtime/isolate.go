@@ -72,7 +72,6 @@ type RunOptions struct {
 	Hostname     string            // container hostname (CLONE_NEWUTS)
 	Mounts       []Mount           // bind mounts, including user volumes
 	Network      *NetworkConfig    // nil means share the host network namespace
-	NoInit       bool              // run the command directly as PID 1
 
 	Stdout *os.File
 	Stderr *os.File
@@ -88,19 +87,22 @@ type RunOptions struct {
 // childConfigFor derives the child's configuration from the parent's options.
 //
 // Its own function so the derivation can be tested without cloning a namespace.
-// UseInit is the reason: it is the negation of NoInit, so the default is "init
-// on", and a test that rewrites that expression rather than calling this proves
-// nothing about what IsolatedRun actually sends. Getting the polarity wrong
-// would silently drop the init shim, which is what makes `stop` work at all —
-// per pid_namespaces(7) a PID 1 with no SIGTERM handler discards the signal, so
-// every stop would degrade to SIGKILL after the full timeout.
+//
+// UseInit is unconditional, and that is a decision rather than an oversight.
+// The init is in-process — ChildMain is already PID 1 and forks the real
+// command as PID 2 — so it costs nothing and leaves no trace in the rootfs,
+// which is what an earlier design that bind-mounted an init binary could not
+// say. Turning it off would break `stop`: per pid_namespaces(7) a PID 1 with no
+// SIGTERM handler discards the signal, so every stop would degrade to SIGKILL
+// after the full timeout. Build RUN steps get it too, where it reaps anything
+// the command daemonises before the delta is taken.
 func childConfigFor(opts RunOptions, workDir string) ChildConfig {
 	return ChildConfig{
 		RootFS:   opts.RootFS,
 		WorkDir:  workDir,
 		Command:  opts.Command,
 		Hostname: opts.Hostname,
-		UseInit:  !opts.NoInit,
+		UseInit:  true,
 		Mounts:   opts.Mounts,
 		Network:  opts.Network,
 	}
@@ -319,6 +321,14 @@ func ChildMain(args []string) bool {
 	}
 
 	if err := syscall.Chdir(cfg.WorkDir); err != nil {
+		// Not fatal — Docker errors here, but a WORKDIR that the image does not
+		// contain is a common enough authoring slip that killing the container
+		// over it is unhelpful. It is announced, though: falling back silently
+		// meant a container that ran in / while the user believed it was in
+		// /app, and every relative path in the command quietly resolved
+		// somewhere else.
+		fmt.Fprintf(os.Stderr, "docksmith: cannot enter %s (%v); running in /\n",
+			cfg.WorkDir, err)
 		if err2 := syscall.Chdir("/"); err2 != nil {
 			fail("chdir /: %v", err2)
 		}

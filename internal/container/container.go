@@ -121,6 +121,16 @@ func Create(stateRoot string, r *Record) error {
 	if err := os.MkdirAll(r.RootFSPath(), 0755); err != nil {
 		return err
 	}
+	// MkdirAll's mode is masked by the process umask, and root's umask is 077
+	// on a number of hardened distributions. Relying on it alone produced 0700
+	// directories there, so `sudo docksmith run` followed by an unprivileged
+	// `docksmith ps` failed with a permission error that pointed at nothing.
+	// Chmod is not masked.
+	for _, dir := range []string{ContainersDir(stateRoot), r.Dir, r.RootFSPath()} {
+		if err := os.Chmod(dir, 0755); err != nil {
+			return err
+		}
+	}
 	if r.Created == "" {
 		r.Created = time.Now().UTC().Format(time.RFC3339)
 	}

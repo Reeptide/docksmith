@@ -189,11 +189,13 @@ func TestExtractTarCannotEscapeDestDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Only paths inside directories this test owns. An earlier version also
+	// checked filepath.Dir(parent), which is the shared /tmp: any unrelated
+	// file left there by anything else on the machine failed the test.
 	for _, escaped := range []string{
 		filepath.Join(parent, "escaped.txt"),
 		filepath.Join(parent, "escaped2.txt"),
 		filepath.Join(parent, "escaped3.txt"),
-		filepath.Dir(parent) + "/escaped2.txt",
 	} {
 		if _, err := os.Lstat(escaped); err == nil {
 			t.Errorf("tar entry escaped the destination: %s", escaped)

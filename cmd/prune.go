@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"docksmith/internal/cache"
 	"docksmith/internal/container"
@@ -101,6 +102,24 @@ func (p prunePlan) describe() string {
 	return b.String()
 }
 
+// createGrace is how long a container may sit in StateCreated before prune
+// treats it as abandoned. Assembly is a layer extraction: seconds for a normal
+// image, and generous here because the cost of guessing wrong in this direction
+// is only that the reclaim waits for the next prune.
+const createGrace = 30 * time.Minute
+
+// abandonedDuringCreate reports whether a StateCreated record is old enough
+// that no `run` can still be working on it. A record with an unparseable
+// timestamp is treated as abandoned: it cannot be newer than the grace period,
+// and leaving it pinned forever is the failure this exists to prevent.
+func abandonedDuringCreate(r *container.Record) bool {
+	created, err := time.Parse(time.RFC3339, r.Created)
+	if err != nil {
+		return true
+	}
+	return time.Since(created) > createGrace
+}
+
 // planPrune decides what is safe to remove. Nothing running is ever touched.
 func planPrune(root string, st *store.State, all bool) (prunePlan, error) {
 	var plan prunePlan
@@ -121,7 +140,15 @@ func planPrune(root string, st *store.State, all bool) (prunePlan, error) {
 		// MarkStarted has not happened yet. Reclaiming it would delete the
 		// directory out from under a container about to pivot_root into it
 		// and hand its address to someone else.
-		if r.State == container.StateRunning || r.State == container.StateCreated {
+		//
+		// But only for as long as assembly could plausibly still be running.
+		// A `run` killed between Create and MarkStarted — Ctrl-C during rootfs
+		// assembly, or a failure on the way to starting — leaves a record in
+		// this state permanently, holding its rootfs and its IP lease against
+		// both prune and the lease reaper, with no process anywhere that will
+		// ever advance it. Past the grace period it is abandoned, not pending.
+		if r.State == container.StateRunning ||
+			(r.State == container.StateCreated && !abandonedDuringCreate(r)) {
 			liveContainers[r.ID] = true
 			continue
 		}

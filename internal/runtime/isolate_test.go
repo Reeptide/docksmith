@@ -94,13 +94,19 @@ func TestLookPathFallsBackToTheBareName(t *testing.T) {
 	}
 }
 
-// UseInit is derived from NoInit, so the default must be "init on".
-func TestInitIsOnByDefault(t *testing.T) {
-	if !childConfigFor(RunOptions{}, "/").UseInit {
-		t.Error("containers should run with an init by default")
-	}
-	if childConfigFor(RunOptions{NoInit: true}, "/").UseInit {
-		t.Error("NoInit should disable the init shim")
+// Every container gets PID 1 with signal handlers. Without it `stop` is broken
+// by design: per pid_namespaces(7) a namespace's init only receives signals it
+// has a handler for, even from an ancestor namespace, so an unhandled SIGTERM
+// is discarded and stop always falls through to SIGKILL after the full timeout.
+func TestInitIsAlwaysOn(t *testing.T) {
+	for _, opts := range []RunOptions{
+		{},
+		{Command: []string{"/bin/sh"}},
+		{Network: &NetworkConfig{}}, // a build RUN step
+	} {
+		if !childConfigFor(opts, "/").UseInit {
+			t.Errorf("UseInit is false for %+v; stop would degrade to SIGKILL", opts)
+		}
 	}
 }
 

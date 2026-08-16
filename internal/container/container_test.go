@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -91,6 +92,27 @@ func TestCreateMakesRootFSDirectory(t *testing.T) {
 	// Readable by an unprivileged `ps`/`logs` even when root created it.
 	if info.Mode().Perm()&0055 == 0 {
 		t.Errorf("container dir mode %v is not world-readable", info.Mode().Perm())
+	}
+}
+
+// The same invariant under a hostile umask, which is where it actually broke:
+// MkdirAll's mode argument is masked, and root's umask is 077 on a number of
+// hardened distributions, so `sudo docksmith run` produced state that an
+// unprivileged `docksmith ps` could not read.
+func TestCreateIgnoresHostUmask(t *testing.T) {
+	old := syscall.Umask(0077)
+	defer syscall.Umask(old)
+
+	root := t.TempDir()
+	r := newRecord(t, root, "x")
+	for _, dir := range []string{ContainersDir(root), r.Dir, r.RootFSPath()} {
+		info, err := os.Stat(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm()&0055 == 0 {
+			t.Errorf("%s is %v under umask 077, want world-readable", dir, info.Mode().Perm())
+		}
 	}
 }
 

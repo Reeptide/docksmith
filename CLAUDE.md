@@ -37,7 +37,7 @@ Unit tests cover everything that does not need privileges. They exist mainly to 
 There is no separate runtime binary and no daemon. `main.go` checks `os.Args[1]` **before any CLI parsing** for three sentinels — that ordering is load-bearing:
 
 - **`__child__`** — the container. Parent sets `SysProcAttr.Cloneflags` and passes a single JSON `ChildConfig` argument (it replaced positional args, which could not carry mounts or network settings). The child configures its network, sets up mounts, enters the rootfs, and runs the command.
-- **`__init__`** — container PID 1, *in-process*. `ChildMain` is already PID 1 inside the namespace, so it forks the real command as PID 2 and stays as init rather than exec'ing a separate binary. This is why no init binary is bind-mounted into the rootfs.
+- **`__init__`** — container PID 1, *in-process*. `ChildMain` is already PID 1 inside the namespace, so it forks the real command as PID 2 and stays as init rather than exec'ing a separate binary. This is why no init binary is bind-mounted into the rootfs — and why it is unconditional, build `RUN` steps included: it costs nothing and leaves no trace in the delta.
 - **`__supervisor__`** — `run -d`. Docksmith re-execs itself with `Setsid`, and that copy blocks in `IsolatedRun`, then writes the container's final state to `config.json`.
 
 ### The FD protocol (`internal/runtime/isolate.go`)
@@ -77,7 +77,9 @@ Manifest file names carry a short digest of the exact reference (`team_app_v1_<h
 
 ### Containers (`internal/container`)
 
-`~/.docksmith/containers/<id>/{config.json,rootfs/,container.log}`. Liveness compares **pid and `/proc/<pid>/stat` start time** — a bare pid check is reuse-unsafe and would let `stop` signal an unrelated process as root. `Reconcile` corrects records left claiming to run by a killed supervisor.
+`~/.docksmith/containers/<id>/{config.json,rootfs/,container.log}`. Liveness compares **pid and `/proc/<pid>/stat` start time** — a bare pid check is reuse-unsafe and would let `stop` signal an unrelated process as root. `Reconcile` corrects records left claiming to run by a killed supervisor. Directory modes are `chmod`ed explicitly after `MkdirAll`, whose mode argument is umask-masked — root's umask is 077 on some distributions, which produced state a `sudo run` wrote and an unprivileged `ps` could not read.
+
+`prune` treats `created` as live only within a 30-minute grace period. A `run` killed between `Create` and `MarkStarted` otherwise leaves a record pinned forever, holding a rootfs and an IP lease that nothing will ever release.
 
 A foreground `run` catches SIGINT/SIGTERM/SIGHUP rather than dying on them (`forwardSignals` in `cmd/run.go`). The terminal sends Ctrl-C to the whole foreground process group, so under the default disposition docksmith died before releasing the IP lease or deleting the container's DNAT rules — which then pointed at an address about to be reallocated. The signal is forwarded to the container explicitly, since a `kill` aimed at docksmith alone never reaches it; a second signal escalates to SIGKILL.
 
