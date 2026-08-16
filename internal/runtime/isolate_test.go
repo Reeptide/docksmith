@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os/exec"
 	"reflect"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -190,4 +191,47 @@ func TestExitStatusPassesOrdinaryExitCodesThrough(t *testing.T) {
 	if got := exitStatus(exitErr); got != 42 {
 		t.Errorf("exitStatus = %d, want 42", got)
 	}
+}
+
+// __DOCKSMITH_CHILD__ is the sentinel the parent sets so the re-exec knows which
+// mode it is in. It is docksmith's own plumbing: leaking it means every process
+// in every container sees a variable naming the runtime it happens to run under,
+// inherited by anything the container spawns, and able to confuse a nested
+// docksmith into thinking it is a child.
+func TestContainerEnvStripsTheChildSentinel(t *testing.T) {
+	t.Setenv(childSentinel, "1")
+	t.Setenv("PATH", "/usr/bin:/bin")
+	t.Setenv("GREETING", "hello")
+
+	env := containerEnv()
+	for _, kv := range env {
+		if strings.HasPrefix(kv, childSentinel+"=") {
+			t.Errorf("%s leaked into the container environment", childSentinel)
+		}
+	}
+	// And it strips only that: everything else must survive, or the container
+	// loses its PATH and the image's ENV.
+	for _, want := range []string{"PATH=/usr/bin:/bin", "GREETING=hello"} {
+		if !containsEnv(env, want) {
+			t.Errorf("%q missing from the container environment", want)
+		}
+	}
+}
+
+// A variable that merely starts with the sentinel's name is a different
+// variable and must survive.
+func TestContainerEnvKeepsSimilarlyNamedVariables(t *testing.T) {
+	t.Setenv(childSentinel+"_EXTRA", "keep")
+	if !containsEnv(containerEnv(), childSentinel+"_EXTRA=keep") {
+		t.Errorf("%s_EXTRA was stripped; only the exact sentinel should be", childSentinel)
+	}
+}
+
+func containsEnv(env []string, want string) bool {
+	for _, kv := range env {
+		if kv == want {
+			return true
+		}
+	}
+	return false
 }

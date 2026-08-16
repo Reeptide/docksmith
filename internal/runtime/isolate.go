@@ -47,6 +47,10 @@ type NetworkConfig struct {
 	MTU       int    `json:"mtu,omitempty"`
 }
 
+// childSentinel marks a re-exec as the container child. It is stripped from the
+// environment before the container's command runs; see containerEnv.
+const childSentinel = "__DOCKSMITH_CHILD__"
+
 // ChildConfig is the complete instruction set handed to the re-executed child,
 // serialised as a single JSON argv element.
 //
@@ -153,7 +157,7 @@ func IsolatedRun(opts RunOptions) (int, error) {
 	}
 
 	cmd := exec.Command(self, "__child__", string(cfgJSON))
-	cmd.Env = append(envSlice(opts.Env, opts.EnvOverrides), "__DOCKSMITH_CHILD__=1")
+	cmd.Env = append(envSlice(opts.Env, opts.EnvOverrides), childSentinel+"=1")
 	cmd.ExtraFiles = []*os.File{errW, syncR} // become FD 3 and FD 4
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: uintptr(cloneFlags),
@@ -245,10 +249,29 @@ func exitStatus(e *exec.ExitError) int {
 	return 1
 }
 
+// containerEnv is the environment handed to the container's command.
+//
+// os.Environ() would include __DOCKSMITH_CHILD__=1, the sentinel the parent sets
+// so the re-exec knows which mode it is in. That is docksmith's own plumbing,
+// and leaking it means every process in every container sees a variable naming
+// the runtime it happens to be running under — visible in `env`, inherited by
+// anything the container spawns, and capable of confusing a nested docksmith.
+func containerEnv() []string {
+	all := os.Environ()
+	out := make([]string, 0, len(all))
+	for _, kv := range all {
+		if strings.HasPrefix(kv, childSentinel+"=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
 // ChildMain is the re-exec entry point. It performs namespace setup, enters the
 // rootfs and runs the command. Returns false when not in child mode.
 func ChildMain(args []string) bool {
-	if os.Getenv("__DOCKSMITH_CHILD__") != "1" {
+	if os.Getenv(childSentinel) != "1" {
 		return false
 	}
 	if len(args) < 2 {
@@ -346,7 +369,7 @@ func ChildMain(args []string) bool {
 		if err != nil {
 			wd = "/"
 		}
-		code, err := runInit(bin, argv, os.Environ(), wd)
+		code, err := runInit(bin, argv, containerEnv(), wd)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "docksmith: %v\n", err)
 			os.Exit(1)
@@ -354,7 +377,7 @@ func ChildMain(args []string) bool {
 		os.Exit(code)
 	}
 
-	if err := syscall.Exec(bin, argv, os.Environ()); err != nil {
+	if err := syscall.Exec(bin, argv, containerEnv()); err != nil {
 		fail("exec %v: %v", cfg.Command, err)
 	}
 	return true // unreachable

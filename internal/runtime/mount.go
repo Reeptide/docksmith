@@ -2,8 +2,11 @@ package runtime
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -155,6 +158,109 @@ func ensureMountPointFile(path string, mode os.FileMode) error {
 	return f.Close()
 }
 
+// remountReadOnlyTree makes a bind mount and everything mounted underneath it
+// read-only.
+//
+// Two separate kernel behaviours make this more than one call. The first is
+// that MS_RDONLY is ignored on the initial MS_BIND, so a second
+// MS_BIND|MS_REMOUNT|MS_RDONLY call is always required — the classic mistake.
+// The second is that the remount applies to that mount alone: MS_REC on a
+// remount does not propagate read-only to submounts. So `-v /mnt:/data:ro`
+// where /mnt has anything mounted inside it produced a read-only /data with
+// fully writable holes in it, which is worse than an honest failure because the
+// user has been told it is read-only.
+//
+// Submounts come from /proc/self/mountinfo, read after the recursive bind so
+// the copies under target are already present. They are remounted deepest-first
+// so a failure leaves the outermost mount writable rather than half-applied.
+func remountReadOnlyTree(target string) error {
+	const flags = syscall.MS_BIND | syscall.MS_REMOUNT | syscall.MS_RDONLY
+
+	points, err := submountsUnder(target)
+	if err != nil {
+		// Fall back to the single remount rather than refusing the mount: a
+		// read-only top level is still better than nothing, and mountinfo being
+		// unreadable is not the user's problem to solve.
+		fmt.Fprintf(os.Stderr, "warning: cannot enumerate submounts of %s: %v\n", target, err)
+		return syscall.Mount("", target, "", flags, "")
+	}
+	for _, p := range points {
+		if err := syscall.Mount("", p, "", flags, ""); err != nil {
+			return fmt.Errorf("%s: %w", p, err)
+		}
+	}
+	return nil
+}
+
+// submountsUnder returns target and every mount point beneath it, deepest
+// first. target is included even when it does not appear in mountinfo, so the
+// caller always has something to remount.
+func submountsUnder(target string) ([]string, error) {
+	f, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return parseSubmounts(f, target), nil
+}
+
+// parseSubmounts is the logic of submountsUnder, split out so it can be tested
+// against a synthetic mountinfo.
+//
+// Reading the real /proc/self/mountinfo makes the test's outcome depend on what
+// this machine happens to have mounted: an implementation that returned only
+// the target and found nothing beneath it passed, because on a host with no
+// nested mounts under the probe path that is also the correct answer. The bug
+// this guards against is precisely "submounts are missed", so the input has to
+// be one where submounts definitely exist.
+func parseSubmounts(r io.Reader, target string) []string {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return []string{target}
+	}
+	seen := map[string]bool{target: true}
+	out := []string{target}
+	for _, line := range strings.Split(string(data), "\n") {
+		// Mount point is field 5 (1-indexed) and is octal-escaped.
+		fields := strings.Fields(line)
+		if len(fields) < 5 {
+			continue
+		}
+		point := unescapeMountPath(fields[4])
+		if point == target || !strings.HasPrefix(point, target+"/") || seen[point] {
+			continue
+		}
+		seen[point] = true
+		out = append(out, point)
+	}
+	// Deepest first: a child must be made read-only before its parent, or the
+	// parent's remount can be undone by a later failure partway down.
+	sort.Slice(out, func(i, j int) bool {
+		return strings.Count(out[i], "/") > strings.Count(out[j], "/")
+	})
+	return out
+}
+
+// unescapeMountPath decodes the octal escapes mountinfo uses for space, tab,
+// newline and backslash in a mount point.
+func unescapeMountPath(s string) string {
+	if !strings.Contains(s, "\\") {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+3 < len(s) {
+			if v, err := strconv.ParseUint(s[i+1:i+4], 8, 8); err == nil {
+				b.WriteByte(byte(v))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
 // bindMount binds a host path to a path inside rootfs.
 //
 // Read-only needs two calls, not one. The kernel ignores every flag except
@@ -193,8 +299,7 @@ func bindMount(rootfs string, m Mount) error {
 		return fmt.Errorf("bind %s -> %s: %w", m.Source, m.Target, err)
 	}
 	if m.ReadOnly {
-		const flags = syscall.MS_BIND | syscall.MS_REMOUNT | syscall.MS_RDONLY
-		if err := syscall.Mount("", target, "", flags, ""); err != nil {
+		if err := remountReadOnlyTree(target); err != nil {
 			return fmt.Errorf("remounting %s read-only: %w", m.Target, err)
 		}
 	}

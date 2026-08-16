@@ -101,6 +101,9 @@ section "4. .docksmithignore"
 inside "ignored files are not copied into the image" bridge \
     '[ -e /app/debug.log ] && echo FAILED || echo PASS'
 
+notok "COPY cannot reach outside the build context" \
+    sh -c 'printf "FROM busybox:latest\nCOPY ../escape.txt /app/\n" > "$0/Docksmithfile.esc"; cp "$0/Docksmithfile" "$0/.keep"; cp "$0/Docksmithfile.esc" "$0/Docksmithfile"; ./docksmith build -t escape:1 "$0"; r=$?; cp "$0/.keep" "$0/Docksmithfile"; exit $r' "$CTX"
+
 section "5. Whiteouts (layer deletions)"
 inside "a file removed by RUN stays removed" bridge \
     '[ -e /bin/ls ] && echo FAILED || echo PASS'
@@ -207,6 +210,14 @@ if [ -n "$lan" ]; then
 else
     skip "LAN address test (no global address)"
 fi
+# While demo_port still holds 18080: a second publisher must be refused, not
+# silently installed ahead of it in the DNAT chain.
+notok "a second container cannot publish a held host port" \
+    ./docksmith run -d --name portclash -p 18080:8080 demo:1 /bin/sh -c "sleep 5"
+./docksmith rm -f portclash >/dev/null 2>&1
+timeout 5 sh -c 'echo | nc -w2 127.0.0.1 18080' 2>/dev/null | grep -q it-works \
+    && pass "the original container still owns the port" \
+    || fail "the original container still owns the port"
 ./docksmith rm -f demo_port >/dev/null 2>&1
 sleep 0.5
 iptables -t nat -S 2>/dev/null | grep -q "dport 18080" \

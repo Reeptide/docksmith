@@ -160,3 +160,32 @@ func TestAsCMDRequiresJSONArray(t *testing.T) {
 		}
 	}
 }
+
+// The build context is what makes a build reproducible on another machine:
+// everything in the image has to come from it or from a previous layer. A
+// source reaching outside reads whatever the build host happens to have, as
+// root, and bakes it into a layer — so the same Docksmithfile produces a
+// different image elsewhere, or fails, for a reason the build output never
+// explains.
+func TestCopyRejectsSourcesOutsideTheBuildContext(t *testing.T) {
+	for _, bad := range []string{
+		"../secrets/key", "..", "../../etc/shadow", "/etc/shadow", "/", "a/../../escape",
+	} {
+		instr := Instruction{Type: InstrCOPY, Args: bad + " /app/", LineNum: 3}
+		if _, err := instr.AsCOPY(); err == nil {
+			t.Errorf("COPY %s /app/ should be rejected", bad)
+		}
+	}
+}
+
+func TestCopyAcceptsOrdinarySources(t *testing.T) {
+	for _, good := range []string{
+		"main.sh", "src/main.sh", "./src/main.sh", "*.txt", "src/**/*.go",
+		"a/../b.txt", // stays inside once cleaned
+	} {
+		instr := Instruction{Type: InstrCOPY, Args: good + " /app/", LineNum: 3}
+		if _, err := instr.AsCOPY(); err != nil {
+			t.Errorf("COPY %s /app/ should be accepted: %v", good, err)
+		}
+	}
+}

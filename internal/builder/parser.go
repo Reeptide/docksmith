@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -99,7 +100,30 @@ func (i *Instruction) AsCOPY() (*ParsedCOPY, error) {
 	if len(parts) < 2 {
 		return nil, fmt.Errorf("line %d: COPY requires <src> <dest>", i.LineNum)
 	}
+	if err := validCopySource(parts[0]); err != nil {
+		return nil, fmt.Errorf("line %d: COPY: %w", i.LineNum, err)
+	}
 	return &ParsedCOPY{Src: parts[0], Dest: parts[1]}, nil
+}
+
+// validCopySource rejects a source that reaches outside the build context.
+//
+// The context is what makes a build reproducible somewhere else: everything an
+// image contains has to come from it or from a previous layer. A source of
+// "../secrets/key" or "/etc/shadow" reads the machine the build happens to run
+// on, as root, and bakes it into a layer — the same Docksmithfile then produces
+// a different image elsewhere, or fails, for a reason nothing in the build
+// output explains. Docker rejects it too.
+func validCopySource(src string) error {
+	if filepath.IsAbs(src) {
+		return fmt.Errorf("source %q is an absolute path; "+
+			"sources must be relative to the build context", src)
+	}
+	cleaned := filepath.ToSlash(filepath.Clean(src))
+	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return fmt.Errorf("source %q is outside the build context", src)
+	}
+	return nil
 }
 
 func (i *Instruction) AsENV() (*ParsedENV, error) {

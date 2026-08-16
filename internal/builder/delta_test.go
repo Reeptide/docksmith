@@ -798,3 +798,28 @@ func TestCopyCacheKeyChangesWhenSourceModeChanges(t *testing.T) {
 		}
 	}
 }
+
+// The other route out of the build context: a symlink inside it whose target is
+// not. COPY reads through symlinks, so without a containment check a context
+// shipping "key -> /etc/shadow" would have a plain `COPY . /app` pull the host's
+// file into the image. The parser's "../" guard cannot see this one.
+func TestCollectGlobRefusesSymlinksLeavingTheContext(t *testing.T) {
+	ctx := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	mustWrite(t, outside, "host secret")
+	mustWrite(t, filepath.Join(ctx, "ok.txt"), "fine")
+	if err := os.Symlink(outside, filepath.Join(ctx, "leak.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	files, err := collectGlob(ctx, "*", &IgnoreList{})
+	if err != nil {
+		return // refused outright, which is the intended outcome
+	}
+	for _, f := range files {
+		data, _, rerr := readCopySource(f.HostPath)
+		if rerr == nil && strings.Contains(string(data), "host secret") {
+			t.Errorf("%s pulled a file from outside the build context", f.RelPath)
+		}
+	}
+}

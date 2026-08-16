@@ -105,6 +105,10 @@ func RunContainer(args []string) error {
 		return fmt.Errorf("run: no CMD defined in image and no command given")
 	}
 
+	if err := checkHostPortConflicts(root, ports, ""); err != nil {
+		return fmt.Errorf("run: %w", err)
+	}
+
 	if name == "" {
 		name = container.GenerateName(root)
 	} else if existing, _ := container.Resolve(root, name); existing != nil && existing.Name == name {

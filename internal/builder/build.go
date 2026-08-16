@@ -483,7 +483,7 @@ func collectGlob(contextDir, pattern string, ignore *IgnoreList) ([]srcFile, err
 					return err
 				}
 				r, _ := filepath.Rel(contextDir, path)
-				if ignore.Match(r) {
+				if ignore.Match(r, d.IsDir()) {
 					if d.IsDir() {
 						return filepath.SkipDir
 					}
@@ -492,15 +492,25 @@ func collectGlob(contextDir, pattern string, ignore *IgnoreList) ([]srcFile, err
 				if d.IsDir() || !copyable(d) {
 					return nil
 				}
+				if _, err := safepath.Resolve(contextDir, r); err != nil {
+					return fmt.Errorf("COPY %s: %w", r, err)
+				}
 				out = append(out, srcFile{HostPath: path, RelPath: r, FromDir: true})
 				return nil
 			})
 			if err != nil {
 				return nil, err
 			}
-		} else if !ignore.Match(rel) {
+		} else if !ignore.Match(rel, false) {
 			if info, err := os.Lstat(m); err != nil || !copyableMode(info.Mode()) {
 				continue
+			}
+			// The parser rejects "../" in the pattern; this catches the other
+			// route out, a symlink inside the context whose target is not.
+			// COPY reads through symlinks, so without this a context could ship
+			// "key -> /etc/shadow" and a plain `COPY . /app` would pull it in.
+			if _, err := safepath.Resolve(contextDir, rel); err != nil {
+				return nil, fmt.Errorf("COPY %s: %w", rel, err)
 			}
 			out = append(out, srcFile{HostPath: m, RelPath: rel})
 		}
@@ -529,7 +539,7 @@ func collectDoubleGlob(contextDir, pattern string, ignore *IgnoreList) ([]srcFil
 			return err
 		}
 		rel, _ := filepath.Rel(contextDir, path)
-		if rel != "." && ignore.Match(rel) {
+		if rel != "." && ignore.Match(rel, d.IsDir()) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}
