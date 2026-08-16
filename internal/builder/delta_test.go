@@ -555,9 +555,9 @@ func TestBuildCopyTarKeepsDirectorySemanticsUnderWorkdir(t *testing.T) {
 // Adding a second file to a source directory must not move where the first one
 // lands. Deciding on len(files) alone meant it did.
 func TestBuildCopyTarPlacementDoesNotDependOnSourceCount(t *testing.T) {
-	one := []srcFile{{HostPath: writeTemp(t, "a"), RelPath: "src/a.txt"}}
+	one := []srcFile{{HostPath: writeTemp(t, "a"), RelPath: "src/a.txt", FromDir: true}}
 	two := append([]srcFile{}, one...)
-	two = append(two, srcFile{HostPath: writeTemp(t, "b"), RelPath: "src/b.txt"})
+	two = append(two, srcFile{HostPath: writeTemp(t, "b"), RelPath: "src/b.txt", FromDir: true})
 
 	tfOne, err := buildCopyTar(one, "/dest", "")
 	if err != nil {
@@ -636,4 +636,108 @@ func copyTarHas(files []store.TarFile, want string) bool {
 		}
 	}
 	return false
+}
+
+// COPY placement, driven through the real collectGlob rather than hand-built
+// srcFiles. Constructing the inputs by hand is how a wrong assumption about
+// what the collector produces gets baked into both the code and its test: the
+// "is the source a directory" decision cannot be recovered from RelPath, since
+// `COPY config/settings.txt` and `COPY config` both yield paths containing a
+// separator while meaning opposite things for the destination.
+func TestCopyPlacementThroughCollectGlob(t *testing.T) {
+	ctx := t.TempDir()
+	mustMkdir(t, filepath.Join(ctx, "config"))
+	mustWrite(t, filepath.Join(ctx, "config/settings.txt"), "setting=1")
+	mustMkdir(t, filepath.Join(ctx, "solo"))
+	mustWrite(t, filepath.Join(ctx, "solo/only.txt"), "x")
+	mustWrite(t, filepath.Join(ctx, "top.txt"), "y")
+
+	cases := []struct {
+		name          string
+		pattern, dest string
+		workDir       string
+		wantFile      string
+		wantNotADirAt string
+	}{
+		{
+			name:          "named file to an explicit path is a rename",
+			pattern:       "config/settings.txt",
+			dest:          "/app/settings.txt",
+			wantFile:      "app/settings.txt",
+			wantNotADirAt: "app/settings.txt",
+		},
+		{
+			name:     "named file into a directory keeps its base name",
+			pattern:  "config/settings.txt",
+			dest:     "/app/",
+			wantFile: "app/config/settings.txt",
+		},
+		{
+			name:     "matched directory with one file is directory-style",
+			pattern:  "solo",
+			dest:     "/app",
+			wantFile: "app/solo/only.txt",
+		},
+		{
+			name:     "named file under WORKDIR with a trailing slash",
+			pattern:  "top.txt",
+			dest:     "bin/",
+			workDir:  "/work",
+			wantFile: "work/bin/top.txt",
+		},
+		{
+			name:          "named file under WORKDIR without a trailing slash",
+			pattern:       "top.txt",
+			dest:          "bin",
+			workDir:       "/work",
+			wantFile:      "work/bin",
+			wantNotADirAt: "work/bin",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			files, err := collectGlob(ctx, c.pattern, &IgnoreList{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(files) == 0 {
+				t.Fatalf("pattern %q matched nothing", c.pattern)
+			}
+			tf, err := buildCopyTar(files, c.dest, c.workDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !copyTarHas(tf, c.wantFile) {
+				t.Errorf("COPY %s %s (WORKDIR %q) -> %v, want a file at %s",
+					c.pattern, c.dest, c.workDir, copyTarPaths(tf), c.wantFile)
+			}
+			if c.wantNotADirAt != "" {
+				// The regression that broke every build: treating a named file
+				// as a directory source turned /app/settings.txt into a
+				// directory, so the next `RUN rm /app/settings.txt` failed with
+				// "is a directory" and the build died.
+				for _, f := range tf {
+					if f.IsDir && strings.TrimSuffix(f.Path, "/") == c.wantNotADirAt {
+						t.Errorf("%s was emitted as a directory: %v",
+							c.wantNotADirAt, copyTarPaths(tf))
+					}
+				}
+			}
+		})
+	}
+}
+
+func mustMkdir(t *testing.T, p string) {
+	t.Helper()
+	if err := os.MkdirAll(p, 0755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustWrite(t *testing.T, p, content string) {
+	t.Helper()
+	if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
 }

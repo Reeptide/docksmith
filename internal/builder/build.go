@@ -425,6 +425,16 @@ func AssembleRootFSInto(m *image.Manifest, st *store.State, dest string) error {
 type srcFile struct {
 	HostPath string
 	RelPath  string
+
+	// FromDir marks a file that was found by walking a directory the pattern
+	// matched, rather than being named by the pattern itself.
+	//
+	// It cannot be inferred from RelPath. "config/settings.txt" contains a
+	// separator either way — because the user wrote `COPY config/settings.txt`
+	// naming one file, or because `COPY config` matched a directory and the
+	// walk found that file inside it. Those two mean opposite things for the
+	// destination, so the collector has to record which it was.
+	FromDir bool
 }
 
 func collectGlob(contextDir, pattern string, ignore *IgnoreList) ([]srcFile, error) {
@@ -457,7 +467,7 @@ func collectGlob(contextDir, pattern string, ignore *IgnoreList) ([]srcFile, err
 				if d.IsDir() || !copyable(d) {
 					return nil
 				}
-				out = append(out, srcFile{HostPath: path, RelPath: r})
+				out = append(out, srcFile{HostPath: path, RelPath: r, FromDir: true})
 				return nil
 			})
 			if err != nil {
@@ -560,10 +570,12 @@ func buildCopyTar(files []srcFile, dest, workDir string) ([]store.TarFile, error
 	// A source that came from walking a directory is directory-style too, even
 	// when the walk found exactly one file. Keying that off len(files) alone
 	// meant adding a second file to a source directory moved where the first
-	// one landed.
+	// one landed. This must come from the collector (srcFile.FromDir), not from
+	// looking for a separator in RelPath: `COPY config/settings.txt /app/x`
+	// names a single file and is a rename, but its RelPath has a separator too.
 	destIsDir := strings.HasSuffix(dest, "/") ||
 		len(files) > 1 ||
-		(len(files) == 1 && strings.Contains(filepath.ToSlash(files[0].RelPath), "/"))
+		(len(files) == 1 && files[0].FromDir)
 
 	if !filepath.IsAbs(dest) && workDir != "" {
 		dest = filepath.Join(workDir, dest)
