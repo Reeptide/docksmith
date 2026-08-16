@@ -823,3 +823,74 @@ func TestCollectGlobRefusesSymlinksLeavingTheContext(t *testing.T) {
 		}
 	}
 }
+
+// The build context is whatever the user typed, and `docksmith build -t x .`
+// is the ordinary invocation, so collectGlob must accept a relative context
+// directory. It did not: safepath.Resolve left a relative root relative, and
+// the containment re-check then rejected every legitimate source with
+// `path "payload.txt" escapes .`. scripts/demo.sh always passes an absolute
+// context, so 59 end-to-end checks all missed it.
+func TestCollectGlobAcceptsARelativeContextDir(t *testing.T) {
+	ctx := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ctx, "payload.txt"), []byte("hello"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(ctx, "src"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ctx, "src", "main.sh"), []byte("echo hi"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(cwd)
+	if err := os.Chdir(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, pattern := range []string{"payload.txt", "src/main.sh", "*"} {
+		rel, err := collectGlob(".", pattern, &IgnoreList{})
+		if err != nil {
+			t.Errorf("collectGlob(\".\", %q) = error %v, want the files", pattern, err)
+			continue
+		}
+		abs, err := collectGlob(ctx, pattern, &IgnoreList{})
+		if err != nil {
+			t.Fatalf("collectGlob(absolute, %q): %v", pattern, err)
+		}
+		if len(rel) != len(abs) {
+			t.Errorf("pattern %q: relative context found %d files, absolute found %d",
+				pattern, len(rel), len(abs))
+			continue
+		}
+		for i := range rel {
+			if rel[i].RelPath != abs[i].RelPath {
+				t.Errorf("pattern %q entry %d: relative context gave RelPath %q, absolute gave %q",
+					pattern, i, rel[i].RelPath, abs[i].RelPath)
+			}
+		}
+	}
+
+	// Containment is unchanged, at each of the two layers that enforce it.
+	// The parser refuses a lexical escape up front...
+	if err := validCopySource("../escape.txt"); err == nil {
+		t.Error("validCopySource(\"../escape.txt\") accepted it, want it refused")
+	}
+	// ...and collectGlob re-checks each match through safepath, which is what
+	// catches a symlink inside the context whose target is not. That check must
+	// still fire with a relative context dir.
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("s"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "secret.txt"), filepath.Join(ctx, "link.txt")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := collectGlob(".", "link.txt", &IgnoreList{})
+	if err == nil && len(got) > 0 {
+		t.Errorf("collectGlob(\".\", \"link.txt\") returned %d files through a symlink escaping the context, want it refused", len(got))
+	}
+}

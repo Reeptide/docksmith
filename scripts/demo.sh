@@ -97,6 +97,15 @@ grep -q "RUN echo built.*CACHE MISS" /tmp/demo-edit.txt \
 ok "chmod on a COPY source invalidates its cache entry" \
     sh -c 'chmod 700 "$0/src/main.sh"; ./docksmith build -t demo:1 "$0" | grep -q "COPY src/main.sh.*CACHE MISS"' "$CTX"
 
+# Every other build check here passes $CTX, an absolute path. `docksmith build
+# -t x .` is the ordinary invocation, and a relative context used to fail every
+# COPY with `path "payload.txt" escapes .` — safepath left a relative root
+# relative, so a contained result failed the prefix check. Absolute-only
+# coverage is precisely why 59 checks missed it.
+ok "COPY works with a relative build context (cd into it and pass '.')" \
+    sh -c 'cd "$0" && "$1" build -t reldemo:1 . >/dev/null 2>&1' "$CTX" "$PWD/docksmith"
+./docksmith rmi reldemo:1 >/dev/null 2>&1
+
 section "4. .docksmithignore"
 inside "ignored files are not copied into the image" bridge \
     '[ -e /app/debug.log ] && echo FAILED || echo PASS'
