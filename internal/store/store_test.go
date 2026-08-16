@@ -285,3 +285,89 @@ func TestBuildTarEmptyInput(t *testing.T) {
 		t.Errorf("empty layer produced %d entries", len(entries))
 	}
 }
+
+// A whiteout must delete the entry at its path, never what that entry points
+// at. Layer extraction resolved the final component through symlinks, so on a
+// busybox rootfs — where /bin is almost entirely links into /bin/busybox — a
+// `RUN rm /bin/ls` produced a whiteout that deleted /bin/busybox and took the
+// shell, and every other applet, with it. The layer itself was correct; the
+// damage happened at extraction, so every image built on busybox was affected.
+func TestWhiteoutRemovesTheSymlinkNotItsTarget(t *testing.T) {
+	dir := t.TempDir()
+	base, err := BuildTar([]TarFile{
+		{Path: "bin/", Mode: 0755, IsDir: true},
+		{Path: "bin/busybox", Mode: 0755, Content: []byte("the only real binary")},
+		{Path: "bin/sh", Mode: 0777, IsSymlink: true, Linkname: "busybox"},
+		{Path: "bin/ls", Mode: 0777, IsSymlink: true, Linkname: "busybox"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ExtractTar(base, dir); err != nil {
+		t.Fatal(err)
+	}
+
+	delta, err := BuildTar([]TarFile{{Path: "bin/ls", Mode: 0644, IsWhiteout: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ExtractTar(delta, dir); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Lstat(filepath.Join(dir, "bin/ls")); !os.IsNotExist(err) {
+		t.Errorf("bin/ls should be gone: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "bin/busybox"))
+	if err != nil {
+		t.Fatalf("the whiteout deleted the symlink's target: %v", err)
+	}
+	if string(data) != "the only real binary" {
+		t.Errorf("bin/busybox = %q", data)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "bin/sh")); err != nil {
+		t.Errorf("an unrelated link into the same target broke: %v", err)
+	}
+}
+
+// The same hazard for content: a later layer writing a regular file at a path
+// held by a symlink must replace the link, not write through it and silently
+// corrupt whatever it pointed at.
+func TestEntryReplacingASymlinkDoesNotWriteThroughIt(t *testing.T) {
+	dir := t.TempDir()
+	base, err := BuildTar([]TarFile{
+		{Path: "bin/", Mode: 0755, IsDir: true},
+		{Path: "bin/busybox", Mode: 0755, Content: []byte("original")},
+		{Path: "bin/ls", Mode: 0777, IsSymlink: true, Linkname: "busybox"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ExtractTar(base, dir); err != nil {
+		t.Fatal(err)
+	}
+
+	delta, err := BuildTar([]TarFile{
+		{Path: "bin/ls", Mode: 0755, Content: []byte("a real ls now")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ExtractTar(delta, dir); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Lstat(filepath.Join(dir, "bin/ls"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Error("bin/ls is still a symlink; the new content went to its target")
+	}
+	if data, _ := os.ReadFile(filepath.Join(dir, "bin/ls")); string(data) != "a real ls now" {
+		t.Errorf("bin/ls = %q", data)
+	}
+	if data, _ := os.ReadFile(filepath.Join(dir, "bin/busybox")); string(data) != "original" {
+		t.Errorf("bin/busybox was overwritten through the link: %q", data)
+	}
+}

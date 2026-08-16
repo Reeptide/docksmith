@@ -61,6 +61,8 @@ Cache keys (`internal/cache/cache.go`) are SHA-256 of: **a layer format version*
 
 Layers are deterministic tars named by the SHA-256 of their bytes. Deletions are OCI-style whiteouts (`.wh.<name>`), and `BuildTar` writes whiteouts **ahead of all content** — lexical order is not sufficient, since `.cache` sorts before `.wh..cache`.
 
+`internal/safepath` has two resolvers and the distinction is load-bearing. `Resolve` follows the final path component; `ResolveNoFollow` resolves only the parent and leaves the last component alone. Anything that **creates, replaces or deletes** an entry — layer extraction, whiteouts, `/etc` generation, bind-mount points — must use `ResolveNoFollow`. A busybox rootfs is almost entirely symlinks into `/bin/busybox`, so following the last component turns a whiteout for `bin/ls` into a deletion of `bin/busybox` and destroys every applet at once. Containment is unaffected: the parent is still resolved, so a symlinked directory mid-path is still caught.
+
 `export.go` implements `save`/`load`; import verifies every layer hash and manifest digest before writing anything, so a corrupt archive leaves the store untouched.
 
 `rmi` and `prune` share `referencedLayers` (`cmd/rmi.go`) and delete only layers no surviving image references. Deleting unconditionally destroys shared base layers and every sibling image.

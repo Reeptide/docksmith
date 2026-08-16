@@ -111,7 +111,7 @@ func writeEtcFile(rootfs, name, content string) error {
 	if _, err := safepath.MkdirAll(rootfs, "etc"); err != nil {
 		return fmt.Errorf("creating /etc in rootfs: %w", err)
 	}
-	path, err := safepath.Resolve(rootfs, "etc/"+name)
+	path, err := safepath.ResolveNoFollow(rootfs, "etc/"+name)
 	if err != nil {
 		return fmt.Errorf("writing /etc/%s: %w", name, err)
 	}

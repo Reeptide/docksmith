@@ -15,6 +15,7 @@ package safepath
 import (
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 )
@@ -55,6 +56,41 @@ func Resolve(root, rel string) (string, error) {
 		trailing = append([]string{filepath.Base(probe)}, trailing...)
 		probe = parent
 	}
+}
+
+// ResolveNoFollow is Resolve for paths that name an entry to be created,
+// replaced or removed rather than read: every component *except the last* is
+// resolved through symlinks, and the final one is left alone.
+//
+// The distinction is not cosmetic. A busybox rootfs is almost entirely symlinks
+// into /bin/busybox, so resolving the last component turns an operation on
+// bin/ls into the same operation on bin/busybox — deleting a whiteout's target
+// takes the shell, and every other applet, with it. Following the last
+// component is right only when the caller genuinely wants what the link points
+// at, which for layer extraction is never.
+func ResolveNoFollow(root, rel string) (string, error) {
+	cleaned := strings.Trim(filepath.ToSlash(filepath.Clean("/"+rel)), "/")
+	if cleaned == "" || cleaned == "." {
+		return Resolve(root, "/")
+	}
+	dir, base := path.Split(cleaned)
+
+	// The parent is resolved normally: traversing a symlinked directory is
+	// legitimate, and Resolve is what enforces that it stays inside root.
+	parent, err := Resolve(root, dir)
+	if err != nil {
+		return "", err
+	}
+	full := filepath.Join(parent, base)
+
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		realRoot = filepath.Clean(root)
+	}
+	if !within(realRoot, full) {
+		return "", fmt.Errorf("path %q escapes %s", rel, root)
+	}
+	return full, nil
 }
 
 // MkdirAll creates rel and its parents inside root, checking containment at

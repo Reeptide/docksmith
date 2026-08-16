@@ -258,7 +258,11 @@ func ExtractTar(data []byte, destDir string) error {
 		// A whiteout entry deletes the path it shadows and is never itself
 		// written to disk.
 		if wh, ok := IsWhiteout(hdr.Name); ok {
-			victim, err := safepath.Resolve(destDir, wh)
+			// NoFollow: the whiteout removes the entry at this path, not
+			// whatever it points at. Following it deletes the link's target —
+			// on a busybox rootfs, where nearly everything under /bin is a link
+			// to busybox, a whiteout for /bin/ls would take the shell with it.
+			victim, err := safepath.ResolveNoFollow(destDir, wh)
 			if err != nil {
 				return fmt.Errorf("whiteout %s: %w", hdr.Name, err)
 			}
@@ -268,7 +272,10 @@ func ExtractTar(data []byte, destDir string) error {
 			continue
 		}
 
-		target, err := safepath.Resolve(destDir, hdr.Name)
+		// NoFollow for the same reason: this entry replaces what is at the
+		// path, so a symlink already sitting there must be overwritten, never
+		// written through to its target.
+		target, err := safepath.ResolveNoFollow(destDir, hdr.Name)
 		if err != nil {
 			return err
 		}

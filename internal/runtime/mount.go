@@ -55,16 +55,18 @@ func mountDevices(rootfs string) {
 		if _, err := os.Stat(host); err != nil {
 			continue
 		}
-		target, err := safepath.Resolve(rootfs, "dev/"+dev)
+		// NoFollow: the mount point is the entry at this path, not whatever it
+		// points at. An image shipping dev/null as a link elsewhere would
+		// otherwise have the host's /dev/null bind-mounted over the link's
+		// target instead.
+		target, err := safepath.ResolveNoFollow(rootfs, "dev/"+dev)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: /dev/%s: %v\n", dev, err)
 			continue
 		}
-		f, err := os.OpenFile(target, os.O_CREATE|os.O_RDONLY, 0666)
-		if err != nil {
+		if err := ensureMountPointFile(target, 0666); err != nil {
 			continue
 		}
-		f.Close()
 		if err := syscall.Mount(host, target, "", syscall.MS_BIND, ""); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: mount /dev/%s: %v\n", dev, err)
 		}
@@ -129,6 +131,30 @@ func EnsureSource(m Mount) error {
 	return nil
 }
 
+// ensureMountPointFile makes sure a file exists at path to bind-mount onto.
+//
+// A symlink already sitting there is replaced rather than opened: OpenFile
+// follows links even when the path was resolved without following, so a
+// dangling one would create the file at the link's target and the bind mount
+// would land in the wrong place. Anything else that already exists is left
+// alone — the mount covers it, and deleting image content to make room for a
+// mount point would be destructive for no gain.
+func ensureMountPointFile(path string, mode os.FileMode) error {
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink == 0 {
+			return nil
+		}
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDONLY|os.O_EXCL, mode)
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
+
 // bindMount binds a host path to a path inside rootfs.
 //
 // Read-only needs two calls, not one. The kernel ignores every flag except
@@ -151,15 +177,16 @@ func bindMount(rootfs string, m Mount) error {
 		if _, err := safepath.MkdirAll(rootfs, filepath.Dir(m.Target)); err != nil {
 			return fmt.Errorf("volume target %s: %w", m.Target, err)
 		}
-		target, err = safepath.Resolve(rootfs, m.Target)
+		// NoFollow for the same reason as /dev: -v host:/data must mount at
+		// /data, even when the image ships /data as a symlink to somewhere
+		// else in the rootfs.
+		target, err = safepath.ResolveNoFollow(rootfs, m.Target)
 		if err != nil {
 			return fmt.Errorf("volume target %s: %w", m.Target, err)
 		}
-		f, err := os.OpenFile(target, os.O_CREATE|os.O_RDONLY, 0644)
-		if err != nil {
+		if err := ensureMountPointFile(target, 0644); err != nil {
 			return fmt.Errorf("volume target %s: %w", m.Target, err)
 		}
-		f.Close()
 	}
 
 	if err := syscall.Mount(m.Source, target, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
