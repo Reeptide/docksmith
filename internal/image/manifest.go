@@ -2,6 +2,7 @@ package image
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -22,6 +23,10 @@ type Config struct {
 	Env        []string `json:"Env"`
 	Cmd        []string `json:"Cmd"`
 	WorkingDir string   `json:"WorkingDir"`
+	// ExposedPorts documents the ports a container listens on, as "80/tcp".
+	// Advisory: it publishes nothing on its own, but supplies the default
+	// container-port set for `run -p`.
+	ExposedPorts []string `json:"ExposedPorts,omitempty"`
 }
 
 // Manifest is the JSON file stored under images/.
@@ -58,9 +63,66 @@ func Finalize(m *Manifest) error {
 }
 
 // ManifestFileName returns the file name used to store this manifest.
+//
+// Both components are sanitised, not just the name: manifests arrive from
+// archives during `docksmith load`, so an unsanitised tag of "../../etc/x"
+// would make filepath.Join escape the images directory entirely and write
+// wherever the archive asked. Anything outside the safe set becomes "_".
+//
+// Sanitising alone is not injective, which matters as much as the traversal it
+// prevents. ValidRef allows "/" in a name, so "team/app:v1", "team_app:v1" and
+// "team:app_v1" all flatten to team_app_v1.json — one image would overwrite
+// another's manifest, and `rmi` on either would garbage-collect the other's
+// layers. Worse, `docksmith load` of an untrusted archive could clobber a local
+// image simply by choosing a reference that flattens to the same name. A digest
+// of the exact reference disambiguates while keeping the readable prefix.
 func ManifestFileName(name, tag string) string {
-	safe := strings.ReplaceAll(name, "/", "_")
-	return fmt.Sprintf("%s_%s.json", safe, tag)
+	h := sha256.Sum256([]byte(name + "\x00" + tag))
+	return fmt.Sprintf("%s_%s_%s.json", sanitiseRef(name), sanitiseRef(tag),
+		hex.EncodeToString(h[:4]))
+}
+
+// sanitiseRef reduces a name or tag to characters that cannot traverse or
+// escape a path.
+func sanitiseRef(s string) string {
+	if s == "" {
+		return "_"
+	}
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-', r == '.', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	out := b.String()
+	// A component consisting only of dots would still be a traversal.
+	if strings.Trim(out, ".") == "" {
+		return "_"
+	}
+	return out
+}
+
+// ValidRef reports whether a name and tag are storable without mangling. Used
+// to reject hostile references outright rather than silently rewriting them.
+func ValidRef(name, tag string) error {
+	if name == "" || tag == "" {
+		return fmt.Errorf("image name and tag must not be empty")
+	}
+	for _, part := range []string{name, tag} {
+		if strings.Contains(part, "..") || strings.ContainsAny(part, `\:`+"\x00") {
+			return fmt.Errorf("invalid image reference %q:%q", name, tag)
+		}
+	}
+	// Names may contain "/" (registry-style); tags may not.
+	if strings.Contains(tag, "/") {
+		return fmt.Errorf("invalid tag %q", tag)
+	}
+	return nil
 }
 
 // Save writes the manifest to imagesDir.
@@ -72,8 +134,29 @@ func Save(m *Manifest, imagesDir string) error {
 	if err != nil {
 		return err
 	}
+	// Write atomically. A plain os.WriteFile truncates in place, and any reader
+	// that catches the window sees an unparseable manifest — which for
+	// referencedLayers means an image's layers drop out of the live set and
+	// prune deletes them.
 	path := filepath.Join(imagesDir, ManifestFileName(m.Name, m.Tag))
-	return os.WriteFile(path, data, 0644)
+	tmp, err := os.CreateTemp(imagesDir, ".tmp-manifest-*")
+	if err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), 0644); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 // Load reads a manifest from imagesDir by name:tag.
@@ -101,16 +184,22 @@ func ListAll(imagesDir string) ([]*Manifest, error) {
 	}
 	var out []*Manifest
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+		// Temp files from an in-flight Save are not manifests yet.
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") || strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(imagesDir, e.Name()))
+		path := filepath.Join(imagesDir, e.Name())
+		data, err := os.ReadFile(path)
 		if err != nil {
-			continue
+			// Deliberately not skipped. Callers include referencedLayers, which
+			// decides what garbage collection may delete — treating a manifest
+			// it cannot read as "references nothing" is how prune ends up
+			// deleting layers a live image still needs.
+			return nil, fmt.Errorf("reading manifest %s: %w", e.Name(), err)
 		}
 		var m Manifest
 		if err := json.Unmarshal(data, &m); err != nil {
-			continue
+			return nil, fmt.Errorf("manifest %s is corrupt: %w", e.Name(), err)
 		}
 		out = append(out, &m)
 	}

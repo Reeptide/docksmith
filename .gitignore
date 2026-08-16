@@ -1,0 +1,20 @@
+# Build artifact. `make build` writes this; it is 4 MB and rebuilt from source,
+# so it never belongs in history. Note that `go build ./...` type-checks without
+# producing it — if a CLI change seems to have done nothing, the binary here is
+# probably stale.
+/docksmith
+
+# Go test and coverage output
+*.test
+*.out
+coverage.html
+
+# Image archives produced by `docksmith save`
+*.tar
+
+# Editor and OS noise
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

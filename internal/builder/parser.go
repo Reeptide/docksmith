@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -17,6 +18,7 @@ const (
 	InstrWORKDIR InstructionType = "WORKDIR"
 	InstrENV     InstructionType = "ENV"
 	InstrCMD     InstructionType = "CMD"
+	InstrEXPOSE  InstructionType = "EXPOSE"
 )
 
 type Instruction struct {
@@ -66,7 +68,7 @@ func ParseFile(path string) ([]Instruction, error) {
 			args = strings.TrimSpace(parts[1])
 		}
 		switch InstructionType(keyword) {
-		case InstrFROM, InstrCOPY, InstrRUN, InstrWORKDIR, InstrENV, InstrCMD:
+		case InstrFROM, InstrCOPY, InstrRUN, InstrWORKDIR, InstrENV, InstrCMD, InstrEXPOSE:
 			instrs = append(instrs, Instruction{
 				LineNum: lineNum,
 				Type:    InstructionType(keyword),
@@ -114,4 +116,32 @@ func (i *Instruction) AsCMD() ([]string, error) {
 		return nil, fmt.Errorf("line %d: CMD must be a JSON array: %w", i.LineNum, err)
 	}
 	return cmd, nil
+}
+
+// AsEXPOSE parses "EXPOSE 80 443/udp" into normalised port/protocol strings.
+//
+// Like ENV, WORKDIR and CMD, EXPOSE produces no layer. It also stays out of
+// cache keys: it cannot change a single byte of any layer, so including it
+// would invalidate every existing cache entry on upgrade and buy nothing.
+func (i *Instruction) AsEXPOSE() ([]string, error) {
+	fields := strings.Fields(i.Args)
+	if len(fields) == 0 {
+		return nil, fmt.Errorf("line %d: EXPOSE requires at least one port", i.LineNum)
+	}
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		port, proto := f, "tcp"
+		if base, p, found := strings.Cut(f, "/"); found {
+			port, proto = base, strings.ToLower(p)
+			if proto != "tcp" && proto != "udp" {
+				return nil, fmt.Errorf("line %d: EXPOSE %q: protocol must be tcp or udp", i.LineNum, f)
+			}
+		}
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return nil, fmt.Errorf("line %d: EXPOSE %q: invalid port", i.LineNum, f)
+		}
+		out = append(out, fmt.Sprintf("%d/%s", n, proto))
+	}
+	return out, nil
 }

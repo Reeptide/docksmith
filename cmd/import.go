@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -130,7 +131,12 @@ func collectDir(dir string) ([]store.TarFile, error) {
 		}
 		mode := int64(0644)
 		if info != nil {
-			mode = int64(info.Mode())
+			// TarMode, not int64(Mode()): Go's FileMode puts setuid, setgid and
+			// sticky in bits that do not match the Unix layout, so a raw
+			// conversion writes nonsense into the tar header. ExtractTar masks
+			// it back off so nothing breaks, but the layer bytes are wrong and
+			// the two import paths disagreed with snapshotDelta.
+			mode = store.TarMode(info.Mode())
 		}
 		files = append(files, store.TarFile{
 			Path:    rel,
@@ -142,15 +148,22 @@ func collectDir(dir string) ([]store.TarFile, error) {
 	return files, err
 }
 
-func readTarArchive(path string) ([]store.TarFile, error) {
-	f, err := os.Open(path)
+// linkSource is a regular file already read from the archive, kept so a hard
+// link pointing at it can be materialised as a copy.
+type linkSource struct {
+	data []byte
+	mode int64
+}
+
+func readTarArchive(archivePath string) ([]store.TarFile, error) {
+	f, err := os.Open(archivePath)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
 	var reader io.Reader = f
-	if strings.HasSuffix(path, ".gz") || strings.HasSuffix(path, ".tgz") {
+	if strings.HasSuffix(archivePath, ".gz") || strings.HasSuffix(archivePath, ".tgz") {
 		gr, err := gzip.NewReader(f)
 		if err != nil {
 			return nil, fmt.Errorf("gzip open: %w", err)
@@ -160,6 +173,10 @@ func readTarArchive(path string) ([]store.TarFile, error) {
 	}
 
 	var files []store.TarFile
+	// Regular-file contents, keyed by cleaned path, so a later hard-link entry
+	// can be resolved. Tar requires the target to appear first, so one pass is
+	// enough.
+	contents := make(map[string]linkSource)
 	tr := tar.NewReader(reader)
 	for {
 		hdr, err := tr.Next()
@@ -185,6 +202,7 @@ func readTarArchive(path string) ([]store.TarFile, error) {
 			if err != nil {
 				return nil, err
 			}
+			contents[path.Clean("/"+hdr.Name)] = linkSource{data: data, mode: hdr.Mode}
 			files = append(files, store.TarFile{
 				Path:    hdr.Name,
 				Mode:    hdr.Mode,
@@ -196,6 +214,25 @@ func readTarArchive(path string) ([]store.TarFile, error) {
 				Mode:      0777,
 				IsSymlink: true,
 				Linkname:  hdr.Linkname,
+			})
+		case tar.TypeLink:
+			// Hard links are common in real base-image tarballs — busybox ships
+			// one per applet in some builds. Dropping them silently made those
+			// files vanish from the imported image with no warning at all.
+			// TarFile has no hard-link kind, so the content is duplicated; the
+			// layer is larger than the source archive but complete, which is
+			// the right trade for an import that runs once.
+			target, ok := contents[path.Clean("/"+hdr.Linkname)]
+			if !ok {
+				fmt.Fprintf(os.Stderr,
+					"warning: %s is a hard link to %s, which is not in the archive; skipping\n",
+					hdr.Name, hdr.Linkname)
+				continue
+			}
+			files = append(files, store.TarFile{
+				Path:    hdr.Name,
+				Mode:    target.mode,
+				Content: target.data,
 			})
 		}
 	}
