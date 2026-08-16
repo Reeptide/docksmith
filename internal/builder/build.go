@@ -181,6 +181,36 @@ func contains(list []string, s string) bool {
 	return false
 }
 
+// copyFileSums summarises each COPY source for the cache key.
+//
+// Mode is in there, not just content. A COPY layer carries each source's
+// permission bits, so `chmod +x deploy.sh` in the build context changes the
+// layer — but it changes no bytes, so a content-only key was identical, the
+// step reported a CACHE HIT, and the old layer with the old mode was served
+// forever. Exactly the failure that made chmod-only RUN steps vanish, one
+// instruction over.
+//
+// No keyFormatVersion bump is needed: the key inputs themselves changed, so old
+// entries simply stop matching, which is the invalidation wanted. The salt is
+// for the other case, where identical inputs must produce a different layer.
+//
+// Its own function so a test can exercise the real thing. Recomputing this
+// expression in a test and comparing it to itself would pass whether or not
+// execCOPY still calls it.
+func copyFileSums(files []srcFile) (map[string]string, error) {
+	sums := make(map[string]string, len(files))
+	for _, sf := range files {
+		data, info, err := readCopySource(sf.HostPath)
+		if err != nil {
+			return nil, fmt.Errorf("COPY %s: %w", sf.RelPath, err)
+		}
+		h := sha256.Sum256(data)
+		sums[sf.RelPath] = fmt.Sprintf("%04o:%s",
+			store.TarMode(info.Mode()), hex.EncodeToString(h[:]))
+	}
+	return sums, nil
+}
+
 func (bc *buildContext) execCOPY(stepNum int, instr Instruction) error {
 	t0 := time.Now()
 	instrText := "COPY " + instr.Args
@@ -202,14 +232,9 @@ func (bc *buildContext) execCOPY(stepNum int, instr Instruction) error {
 	})
 
 	// File digests for cache key (sorted by rel path).
-	fileSums := make(map[string]string)
-	for _, sf := range srcFiles {
-		data, _, err := readCopySource(sf.HostPath)
-		if err != nil {
-			return fmt.Errorf("line %d: COPY %s: %w", instr.LineNum, sf.RelPath, err)
-		}
-		h := sha256.Sum256(data)
-		fileSums[sf.RelPath] = hex.EncodeToString(h[:])
+	fileSums, err := copyFileSums(srcFiles)
+	if err != nil {
+		return fmt.Errorf("line %d: %w", instr.LineNum, err)
 	}
 
 	cacheKey := cache.ComputeKey(cache.KeyParams{
@@ -458,7 +483,7 @@ func collectGlob(contextDir, pattern string, ignore *IgnoreList) ([]srcFile, err
 					return err
 				}
 				r, _ := filepath.Rel(contextDir, path)
-				if ignore.Match(r) {
+				if ignore.Match(r, d.IsDir()) {
 					if d.IsDir() {
 						return filepath.SkipDir
 					}
@@ -467,15 +492,25 @@ func collectGlob(contextDir, pattern string, ignore *IgnoreList) ([]srcFile, err
 				if d.IsDir() || !copyable(d) {
 					return nil
 				}
+				if _, err := safepath.Resolve(contextDir, r); err != nil {
+					return fmt.Errorf("COPY %s: %w", r, err)
+				}
 				out = append(out, srcFile{HostPath: path, RelPath: r, FromDir: true})
 				return nil
 			})
 			if err != nil {
 				return nil, err
 			}
-		} else if !ignore.Match(rel) {
+		} else if !ignore.Match(rel, false) {
 			if info, err := os.Lstat(m); err != nil || !copyableMode(info.Mode()) {
 				continue
+			}
+			// The parser rejects "../" in the pattern; this catches the other
+			// route out, a symlink inside the context whose target is not.
+			// COPY reads through symlinks, so without this a context could ship
+			// "key -> /etc/shadow" and a plain `COPY . /app` would pull it in.
+			if _, err := safepath.Resolve(contextDir, rel); err != nil {
+				return nil, fmt.Errorf("COPY %s: %w", rel, err)
 			}
 			out = append(out, srcFile{HostPath: m, RelPath: rel})
 		}
@@ -504,7 +539,7 @@ func collectDoubleGlob(contextDir, pattern string, ignore *IgnoreList) ([]srcFil
 			return err
 		}
 		rel, _ := filepath.Rel(contextDir, path)
-		if rel != "." && ignore.Match(rel) {
+		if rel != "." && ignore.Match(rel, d.IsDir()) {
 			if d.IsDir() {
 				return filepath.SkipDir
 			}

@@ -1,8 +1,11 @@
 package cmd
 
 import (
+	"os"
+	"strings"
 	"testing"
 
+	"docksmith/internal/container"
 	"docksmith/internal/network"
 )
 
@@ -63,5 +66,76 @@ func TestApplyExposedDefaultsLeavesUnmatchedPortsUnresolved(t *testing.T) {
 	}
 	if got[1].ContainerPort != 0 {
 		t.Errorf("second port = %d, want 0 so the caller can report it", got[1].ContainerPort)
+	}
+}
+
+// Two containers publishing the same host port is silently broken, not an
+// error: both DNAT rules exist, the newer sits ahead of the older at the head
+// of the chain, and the first container stops receiving traffic while `ps`
+// still shows it owning the port. Nothing reports it — it reads as the
+// application breaking.
+func TestCheckHostPortConflictsRejectsAPortAnotherContainerHolds(t *testing.T) {
+	root := t.TempDir()
+	existing := &container.Record{
+		ID:      "aaaa000000000000",
+		Name:    "web",
+		NetMode: NetBridge,
+		Ports:   []network.PortMapping{{HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}},
+	}
+	if err := container.Create(root, existing); err != nil {
+		t.Fatal(err)
+	}
+	existing.MarkStarted(os.Getpid())
+	if err := container.Save(existing); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []network.PortMapping{{HostPort: 8080, ContainerPort: 3000, Protocol: "tcp"}}
+	err := checkHostPortConflicts(root, want, "")
+	if err == nil {
+		t.Fatal("publishing a host port another running container holds should be refused")
+	}
+	if !strings.Contains(err.Error(), "web") {
+		t.Errorf("error should name the container holding the port, got: %v", err)
+	}
+
+	// A different protocol on the same number is not a conflict.
+	udp := []network.PortMapping{{HostPort: 8080, ContainerPort: 80, Protocol: "udp"}}
+	if err := checkHostPortConflicts(root, udp, ""); err != nil {
+		t.Errorf("udp/8080 does not conflict with tcp/8080: %v", err)
+	}
+
+	// Neither is a free port.
+	free := []network.PortMapping{{HostPort: 9090, ContainerPort: 80, Protocol: "tcp"}}
+	if err := checkHostPortConflicts(root, free, ""); err != nil {
+		t.Errorf("an unused port should be allowed: %v", err)
+	}
+
+	// The container's own record must not block its own restart.
+	if err := checkHostPortConflicts(root, want, existing.ID); err != nil {
+		t.Errorf("a container must not conflict with itself: %v", err)
+	}
+}
+
+// An exited container releases its ports; its record still lists them.
+func TestCheckHostPortConflictsIgnoresExitedContainers(t *testing.T) {
+	root := t.TempDir()
+	dead := &container.Record{
+		ID:      "bbbb000000000000",
+		Name:    "old",
+		NetMode: NetBridge,
+		Ports:   []network.PortMapping{{HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}},
+	}
+	if err := container.Create(root, dead); err != nil {
+		t.Fatal(err)
+	}
+	dead.MarkExited(0)
+	if err := container.Save(dead); err != nil {
+		t.Fatal(err)
+	}
+
+	ports := []network.PortMapping{{HostPort: 8080, ContainerPort: 80, Protocol: "tcp"}}
+	if err := checkHostPortConflicts(root, ports, ""); err != nil {
+		t.Errorf("an exited container must not hold its ports: %v", err)
 	}
 }

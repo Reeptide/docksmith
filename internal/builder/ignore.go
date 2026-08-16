@@ -73,7 +73,11 @@ func LoadIgnoreList(contextDir string) (*IgnoreList, error) {
 
 // Match reports whether a context-relative path is excluded. Later rules win,
 // so a "!" rule can re-include something an earlier rule excluded.
-func (il *IgnoreList) Match(rel string) bool {
+//
+// isDir is needed for trailing-slash rules: "build/" names a directory and must
+// not exclude a regular file that happens to be called "build". Without it the
+// dirOnly flag was parsed and then never consulted, so the slash meant nothing.
+func (il *IgnoreList) Match(rel string, isDir bool) bool {
 	rel = filepath.ToSlash(rel)
 
 	// The ignore file never enters an image, and neither does docksmith's own
@@ -84,7 +88,7 @@ func (il *IgnoreList) Match(rel string) bool {
 
 	excluded := false
 	for _, p := range il.patterns {
-		if p.matches(rel) {
+		if p.matches(rel, isDir) {
 			excluded = !p.negate
 		}
 	}
@@ -93,13 +97,16 @@ func (il *IgnoreList) Match(rel string) bool {
 
 // matches reports whether rel is covered by this rule, either directly or by
 // sitting underneath a matched directory.
-func (p ignorePattern) matches(rel string) bool {
+func (p ignorePattern) matches(rel string, isDir bool) bool {
 	if matchPath(p.pattern, rel) {
-		return true
+		// A trailing-slash rule names a directory, so it does not exclude a
+		// file of the same name.
+		return !p.dirOnly || isDir
 	}
 	// A rule matches everything beneath a directory it names: "build/" covers
 	// "build/out/app". Walk the ancestors rather than string-prefixing, so
-	// "build" does not accidentally match "buildkit/x".
+	// "build" does not accidentally match "buildkit/x". Every ancestor is a
+	// directory by definition, so dirOnly is satisfied here regardless.
 	for dir := pathDir(rel); dir != ""; dir = pathDir(dir) {
 		if matchPath(p.pattern, dir) {
 			return true

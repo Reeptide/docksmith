@@ -263,3 +263,48 @@ func TestCommandStringTruncates(t *testing.T) {
 		t.Errorf("short commands should be intact, got %q", r.CommandString())
 	}
 }
+
+// A record with no recorded start time must be reported dead, not alive.
+//
+// Falling back to a bare pid check is the reuse-unsafe behaviour StartTime
+// exists to prevent: after a reboot or pid wraparound the pid belongs to an
+// unrelated process, and `stop` would send it SIGTERM and then SIGKILL as root.
+// Being wrong the other way costs a container reported as Exited while it runs,
+// which prune and rm both handle.
+func TestIsAliveRefusesToGuessWithoutAStartTime(t *testing.T) {
+	// pid 1 always exists, so a bare pid check would call this alive.
+	r := &Record{Pid: 1, State: StateRunning, StartTime: 0}
+	if r.IsAlive() {
+		t.Error("a record with no start time was reported alive; " +
+			"stop would signal pid 1 as root")
+	}
+
+	// With the real start time it is alive, so the check is not simply
+	// answering false to everything.
+	start, err := ReadStartTime(1)
+	if err != nil {
+		t.Skipf("cannot read /proc/1/stat: %v", err)
+	}
+	r.StartTime = start
+	if !r.IsAlive() {
+		t.Error("a record with a matching start time should be alive")
+	}
+
+	// A mismatched start time is a recycled pid.
+	r.StartTime = start + 1
+	if r.IsAlive() {
+		t.Error("a mismatched start time must be treated as a recycled pid")
+	}
+}
+
+// MarkStarted must record the start time, since IsAlive now depends on it.
+func TestMarkStartedRecordsStartTime(t *testing.T) {
+	r := &Record{}
+	r.MarkStarted(os.Getpid())
+	if r.StartTime == 0 {
+		t.Fatal("MarkStarted left StartTime at 0; the container would be invisible to ps")
+	}
+	if !r.IsAlive() {
+		t.Error("a just-started record should be alive")
+	}
+}

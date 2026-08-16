@@ -195,6 +195,54 @@ func applyExposedDefaults(ports []network.PortMapping, exposed []string) []netwo
 	return ports
 }
 
+// checkHostPortConflicts refuses a publish that another live container already
+// holds.
+//
+// parsePortArgs only dedupes within a single invocation, so two containers
+// could each publish -p 8080:80. Both DNAT rules exist, the newer one sits
+// ahead of the older at the head of the chain, and the first container silently
+// stops receiving traffic while `ps` still shows it owning the port. Nothing
+// reports this: it looks like the application broke.
+//
+// Not race-free — two `run`s starting at once can both pass this — but the
+// window is small and the failure it removes is the common one, a port left
+// published by a container the user forgot about.
+func checkHostPortConflicts(root string, ports []network.PortMapping, selfID string) error {
+	if len(ports) == 0 {
+		return nil
+	}
+	records, err := container.List(root)
+	if err != nil {
+		return nil // cannot enumerate; do not block the run over it
+	}
+	held := make(map[string]*container.Record)
+	for _, r := range records {
+		if r.ID == selfID || r.NetMode != NetBridge {
+			continue
+		}
+		if r.Reconcile() {
+			container.Save(r)
+		}
+		if r.State != container.StateRunning && r.State != container.StateCreated {
+			continue
+		}
+		for _, p := range r.Ports {
+			held[fmt.Sprintf("%d/%s", p.HostPort, p.Protocol)] = r
+		}
+	}
+	for _, p := range ports {
+		if owner, taken := held[fmt.Sprintf("%d/%s", p.HostPort, p.Protocol)]; taken {
+			name := owner.Name
+			if name == "" {
+				name = container.ShortID(owner.ID)
+			}
+			return fmt.Errorf("host port %d/%s is already published by container %s",
+				p.HostPort, p.Protocol, name)
+		}
+	}
+	return nil
+}
+
 // portsColumn renders the PORTS column for `docksmith ps`.
 func portsColumn(ports []network.PortMapping) string {
 	if len(ports) == 0 {

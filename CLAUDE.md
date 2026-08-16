@@ -53,9 +53,11 @@ The parent must drain FD 3 **in a goroutine**. Reading it inline deadlocks: the 
 
 The diff compares `entrySignature`, which encodes an entry's **kind and permissions as well as its bytes** and never follows a symlink. Mode is in there because `RUN chmod +x` changes no bytes: a content-only comparison produced an empty layer and the container failed at runtime with "permission denied" and nothing in the build output. Kind matters because a path whose type changed cannot be fixed by writing the new entry over the old one, so a type change emits a whiteout first. Symlinks are read with `Readlink`, not through: following them turned every link a `RUN` created into a full copy of its target, which on a busybox rootfs is a megabyte per applet. FIFOs, sockets and device nodes are skipped without ever being opened — `os.ReadFile` on a FIFO blocks until a writer appears, so a stray FIFO hangs the build forever with no timeout.
 
-`ignore.go` implements `.docksmithignore`, applied inside `collectGlob` so ignored files affect neither layer contents nor `COPY` cache keys.
+`ignore.go` implements `.docksmithignore`, applied inside `collectGlob` so ignored files affect neither layer contents nor `COPY` cache keys. `Match` takes `isDir` because a trailing-slash rule (`build/`) names a directory and must not exclude a file of the same name.
 
-Cache keys (`internal/cache/cache.go`) are SHA-256 of: **a layer format version**, the previous layer digest, the instruction text, `WORKDIR`, accumulated `ENV` (sorted), and for `COPY` each source file's SHA-256 (sorted). **Bump `keyFormatVersion` whenever `BuildTar` output or `snapshotDelta`'s encoding changes for the same inputs** — without it, layers built by older code are silently reused. The bump is pinned by a golden digest in `cache_test.go`, which is *expected* to fail on a bump; recompute it deliberately rather than deleting the assertion. `EXPOSE` is deliberately *not* in the key. **Cascade rule:** one miss forces all later steps to miss.
+`COPY` sources cannot leave the build context: the parser rejects absolute paths and `../`, and `collectGlob` re-checks each match through `safepath` to catch a symlink inside the context whose target is not. Without both, a build reads the host it happens to run on and stops being reproducible anywhere else.
+
+Cache keys (`internal/cache/cache.go`) are SHA-256 of: **a layer format version**, the previous layer digest, the instruction text, `WORKDIR`, accumulated `ENV` (sorted), and for `COPY` each source file's mode and SHA-256 (sorted). **Bump `keyFormatVersion` whenever `BuildTar` output or `snapshotDelta`'s encoding changes for the same inputs** — without it, layers built by older code are silently reused. The bump is pinned by a golden digest in `cache_test.go`, which is *expected* to fail on a bump; recompute it deliberately rather than deleting the assertion. `EXPOSE` is deliberately *not* in the key. **Cascade rule:** one miss forces all later steps to miss.
 
 ### Storage (`internal/store`, `internal/image`)
 
@@ -71,13 +73,13 @@ Manifest file names carry a short digest of the exact reference (`team_app_v1_<h
 
 ### Runtime (`internal/runtime`)
 
-`mount.go` — `MS_REC|MS_PRIVATE` on `/` before any mount (required for `pivot_root`, and prevents leaking mounts to a systemd host), then `pivot_root`. Pre-pivot failures warn and fall back to `chroot`; **post-pivot failures are fatal**, since a failed unmount leaves the host filesystem readable at `/.oldroot`. Read-only bind mounts need a second `MS_BIND|MS_REMOUNT|MS_RDONLY` call — the kernel ignores flags on the first.
+`mount.go` — `MS_REC|MS_PRIVATE` on `/` before any mount (required for `pivot_root`, and prevents leaking mounts to a systemd host), then `pivot_root`. Pre-pivot failures warn and fall back to `chroot`; **post-pivot failures are fatal**, since a failed unmount leaves the host filesystem readable at `/.oldroot`. Read-only bind mounts need a second `MS_BIND|MS_REMOUNT|MS_RDONLY` call — the kernel ignores flags on the first — and that remount covers only its own mount, so every submount under the target is enumerated from `/proc/self/mountinfo` and remounted too, deepest first. Otherwise `:ro` yields a read-only mount with writable holes in it.
 
 `init.go` — PID 1 must handle signals explicitly: per `pid_namespaces(7)` a namespace's init only receives signals it has a handler for, even from an ancestor namespace, so an unhandled SIGTERM is discarded and `stop` degrades to SIGKILL after the full timeout. Uses `syscall.ForkExec`, never `os/exec`, whose internal reaper races the `Wait4(-1)` loop and eats the exit status.
 
 ### Containers (`internal/container`)
 
-`~/.docksmith/containers/<id>/{config.json,rootfs/,container.log}`. Liveness compares **pid and `/proc/<pid>/stat` start time** — a bare pid check is reuse-unsafe and would let `stop` signal an unrelated process as root. `Reconcile` corrects records left claiming to run by a killed supervisor. Directory modes are `chmod`ed explicitly after `MkdirAll`, whose mode argument is umask-masked — root's umask is 077 on some distributions, which produced state a `sudo run` wrote and an unprivileged `ps` could not read.
+`~/.docksmith/containers/<id>/{config.json,rootfs/,container.log}`. Liveness compares **pid and `/proc/<pid>/stat` start time**, and a record with no recorded start time is reported *dead* rather than falling back to a bare pid check — a bare pid check is reuse-unsafe and would let `stop` signal an unrelated process as root. `Reconcile` corrects records left claiming to run by a killed supervisor. Directory modes are `chmod`ed explicitly after `MkdirAll`, whose mode argument is umask-masked — root's umask is 077 on some distributions, which produced state a `sudo run` wrote and an unprivileged `ps` could not read.
 
 `prune` treats `created` as live only within a 30-minute grace period. A `run` killed between `Create` and `MarkStarted` otherwise leaves a record pinned forever, holding a rootfs and an IP lease that nothing will ever release.
 
@@ -87,7 +89,7 @@ A foreground `run` catches SIGINT/SIGTERM/SIGHUP rather than dying on them (`for
 
 `internal/netlink` is a hand-rolled rtnetlink client: socket, sequence numbers, `NLMSG_ERROR` decoding, `rtattr` TLV encoding with nesting. Structs and constants come from stdlib `syscall`; only `IFLA_INFO_KIND`, `IFLA_INFO_DATA`, `VETH_INFO_PEER` are local. Payloads returned from a dump **must be copied** — they alias the receive buffer that the next `Recvfrom` overwrites.
 
-`internal/network` — `docksmith0` bridge, IPAM under a `flock`, DNS/hosts generation (loopback resolvers are filtered; systemd-resolved's `127.0.0.53` points at nothing inside a container). `nat.go` shells out to `iptables` and is the **only** external-binary dependency; it uses `-I` not `-A` because Docker's rules sit at the head of `FORWARD` with a `DROP` policy. Published ports need MASQUERADE for `127.0.0.0/8` sources plus `route_localnet`, or the container replies to its own loopback.
+`internal/network` — `docksmith0` bridge, IPAM under a `flock`, DNS/hosts generation (loopback resolvers are filtered; systemd-resolved's `127.0.0.53` points at nothing inside a container). `nat.go` shells out to `iptables` and is the **only** external-binary dependency; it uses `-I` not `-A` because Docker's rules sit at the head of `FORWARD` with a `DROP` policy. Published ports need MASQUERADE for `127.0.0.0/8` sources plus `route_localnet`, or the container replies to its own loopback. A host port already published by a live container is refused up front — two DNAT rules for the same port silently starve the older container, since the newer rule goes in at the head of the chain.
 
 ### State root (`cmd/state.go`)
 

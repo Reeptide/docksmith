@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"docksmith/internal/cache"
 	"docksmith/internal/image"
 	"docksmith/internal/store"
 )
@@ -739,5 +740,86 @@ func mustWrite(t *testing.T, p, content string) {
 	t.Helper()
 	if err := os.WriteFile(p, []byte(content), 0644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A chmod in the build context must invalidate the COPY step that reads it.
+//
+// COPY layers carry permission bits, so `chmod +x deploy.sh` changes the layer
+// — but it changes no bytes, so a content-only cache key was identical, the
+// step reported a CACHE HIT and the old layer with the old mode was served
+// forever. The same failure that made chmod-only RUN steps vanish, one
+// instruction over.
+func TestCopyCacheKeyChangesWhenSourceModeChanges(t *testing.T) {
+	ctx := t.TempDir()
+	src := filepath.Join(ctx, "deploy.sh")
+	mustWrite(t, src, "#!/bin/sh\n")
+
+	// Through the production helper, not a reimplementation of it: recomputing
+	// the expression here and comparing it to itself would pass whether or not
+	// execCOPY still folds the mode in.
+	key := func() string {
+		files, err := collectGlob(ctx, "deploy.sh", &IgnoreList{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		sums, err := copyFileSums(files)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cache.ComputeKey(cache.KeyParams{
+			Instruction: "COPY deploy.sh /app/deploy.sh",
+			FileSums:    sums,
+		})
+	}
+
+	before := key()
+	if err := os.Chmod(src, 0755); err != nil {
+		t.Fatal(err)
+	}
+	after := key()
+	if before == after {
+		t.Error("chmod +x on a COPY source did not change the cache key; " +
+			"the step would report a CACHE HIT and serve the old mode")
+	}
+
+	// And the layer really does differ, which is why the key has to.
+	files, err := collectGlob(ctx, "deploy.sh", &IgnoreList{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tf, err := buildCopyTar(files, "/app/deploy.sh", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range tf {
+		if f.Path == "app/deploy.sh" && f.Mode&0111 == 0 {
+			t.Errorf("COPY layer mode = %04o, want the executable bit", f.Mode)
+		}
+	}
+}
+
+// The other route out of the build context: a symlink inside it whose target is
+// not. COPY reads through symlinks, so without a containment check a context
+// shipping "key -> /etc/shadow" would have a plain `COPY . /app` pull the host's
+// file into the image. The parser's "../" guard cannot see this one.
+func TestCollectGlobRefusesSymlinksLeavingTheContext(t *testing.T) {
+	ctx := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	mustWrite(t, outside, "host secret")
+	mustWrite(t, filepath.Join(ctx, "ok.txt"), "fine")
+	if err := os.Symlink(outside, filepath.Join(ctx, "leak.txt")); err != nil {
+		t.Fatal(err)
+	}
+
+	files, err := collectGlob(ctx, "*", &IgnoreList{})
+	if err != nil {
+		return // refused outright, which is the intended outcome
+	}
+	for _, f := range files {
+		data, _, rerr := readCopySource(f.HostPath)
+		if rerr == nil && strings.Contains(string(data), "host secret") {
+			t.Errorf("%s pulled a file from outside the build context", f.RelPath)
+		}
 	}
 }
