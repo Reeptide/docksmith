@@ -68,6 +68,7 @@ COPY config/settings.txt /app/settings.txt
 RUN echo built > /app/marker.txt
 RUN rm /bin/ls
 RUN ln -s /app/marker.txt /app/link-to-marker
+RUN chmod 755 /app/main.sh
 RUN rm /app/settings.txt && mkdir -p /app/settings.txt && echo nested > /app/settings.txt/inner
 CMD ["/bin/sh", "/app/main.sh"]
 EOF
@@ -109,6 +110,8 @@ inside "  and it still points where it was made to point" bridge \
     '[ "$(readlink /app/link-to-marker)" = /app/marker.txt ] && echo PASS || echo FAILED'
 inside "a file replaced by a directory reassembles as a directory" bridge \
     '[ -d /app/settings.txt ] && [ "$(cat /app/settings.txt/inner)" = nested ] && echo PASS || echo FAILED'
+inside "a chmod-only RUN survives into the image" bridge \
+    '[ -x /app/main.sh ] && echo PASS || echo FAILED'
 
 section "6. Isolation"
 inside "no /.oldroot leaked (pivot_root cleaned up)" bridge \
@@ -159,7 +162,12 @@ sleep 1.5
 ok "resolve by id prefix" ./docksmith logs "${cid:0:6}"
 ./docksmith stop demo_bg >/dev/null 2>&1
 ./docksmith ps -a 2>/dev/null | grep demo_bg | grep -q Exited && pass "exit recorded after stop" || fail "exit recorded after stop"
-notok "rm refuses a running container" sh -c './docksmith run -d --name demo_live demo:1 /bin/sh -c "sleep 30" >/dev/null 2>&1; sleep 1; ./docksmith rm demo_live'
+# Start and assert separately: folding both into one sh -c meant a failed
+# `run -d` also failed the `rm`, so the check passed for the wrong reason.
+ok "detached container for the rm check starts" \
+    ./docksmith run -d --name demo_live demo:1 /bin/sh -c "sleep 30"
+sleep 1
+notok "rm refuses a running container" ./docksmith rm demo_live
 ok "rm -f removes a running container" ./docksmith rm -f demo_live
 ok "rm removes an exited container" ./docksmith rm demo_bg
 

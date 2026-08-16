@@ -5,6 +5,7 @@ import (
 	"docksmith/internal/cache"
 	"docksmith/internal/image"
 	"docksmith/internal/runtime"
+	"docksmith/internal/safepath"
 	"docksmith/internal/store"
 	"encoding/hex"
 	"fmt"
@@ -203,9 +204,9 @@ func (bc *buildContext) execCOPY(stepNum int, instr Instruction) error {
 	// File digests for cache key (sorted by rel path).
 	fileSums := make(map[string]string)
 	for _, sf := range srcFiles {
-		data, err := os.ReadFile(sf.HostPath)
+		data, _, err := readCopySource(sf.HostPath)
 		if err != nil {
-			return err
+			return fmt.Errorf("line %d: COPY %s: %w", instr.LineNum, sf.RelPath, err)
 		}
 		h := sha256.Sum256(data)
 		fileSums[sf.RelPath] = hex.EncodeToString(h[:])
@@ -305,7 +306,17 @@ func (bc *buildContext) execRUN(stepNum int, instr Instruction) error {
 
 	// Ensure workDir exists.
 	if bc.workDir != "" {
-		os.MkdirAll(filepath.Join(rootfs, bc.workDir), 0755)
+		// Through safepath, like every other write into a rootfs. This runs as
+		// root in the host's mount namespace before the child exists, so a
+		// plain Join would let `WORKDIR ../../../var/tmp/x` create directories
+		// on the host, and would follow a base image's own `tmp -> /host/tmp`
+		// straight out of the rootfs. The error is reported rather than
+		// discarded: silently skipping it surfaces later as an unexplained
+		// chdir fallback to /.
+		if _, err := safepath.MkdirAll(rootfs, bc.workDir); err != nil {
+			os.RemoveAll(rootfs)
+			return fmt.Errorf("WORKDIR %s: %w", bc.workDir, err)
+		}
 	}
 
 	exitCode, runErr := runtime.IsolatedRun(runtime.RunOptions{
@@ -456,7 +467,7 @@ func collectGlob(contextDir, pattern string, ignore *IgnoreList) ([]srcFile, err
 					}
 					return nil
 				}
-				if d.IsDir() {
+				if d.IsDir() || !copyable(d) {
 					return nil
 				}
 				out = append(out, srcFile{HostPath: path, RelPath: r})
@@ -466,10 +477,27 @@ func collectGlob(contextDir, pattern string, ignore *IgnoreList) ([]srcFile, err
 				return nil, err
 			}
 		} else if !ignore.Match(rel) {
+			if info, err := os.Lstat(m); err != nil || !copyableMode(info.Mode()) {
+				continue
+			}
 			out = append(out, srcFile{HostPath: m, RelPath: rel})
 		}
 	}
 	return out, nil
+}
+
+// copyable reports whether a build-context entry can be put in a layer.
+//
+// COPY reads sources with os.ReadFile, and reading a FIFO blocks until a writer
+// appears — inside a build, forever, with no timeout and no diagnostic. A
+// single stray named pipe anywhere under a `COPY . /app` context therefore
+// wedges the build before it even consults the cache, so neither --no-cache nor
+// re-running helps. Sockets and device nodes are equally unrepresentable in a
+// layer. snapshotDelta already skips these; the COPY path did not.
+func copyable(d fs.DirEntry) bool { return copyableMode(d.Type()) }
+
+func copyableMode(m fs.FileMode) bool {
+	return m.IsRegular() || m&fs.ModeSymlink != 0
 }
 
 func collectDoubleGlob(contextDir, pattern string, ignore *IgnoreList) ([]srcFile, error) {
@@ -485,7 +513,7 @@ func collectDoubleGlob(contextDir, pattern string, ignore *IgnoreList) ([]srcFil
 			}
 			return nil
 		}
-		if d.IsDir() {
+		if d.IsDir() || !copyable(d) {
 			return nil
 		}
 		matched, _ := filepath.Match(strings.ReplaceAll(pattern, "**", "*"), rel)
@@ -497,7 +525,59 @@ func collectDoubleGlob(contextDir, pattern string, ignore *IgnoreList) ([]srcFil
 	return out, err
 }
 
+// readCopySource reads one COPY source, refusing anything that is not a regular
+// file once symlinks have been resolved.
+//
+// collectGlob already filters the context walk, but a symlink pointing at a
+// FIFO passes that filter and reading it blocks forever — the same hang, one
+// level of indirection away. Statting first turns a build that wedges with no
+// output into one that names the offending path and stops.
+func readCopySource(hostPath string) ([]byte, os.FileInfo, error) {
+	info, err := os.Stat(hostPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, nil, fmt.Errorf("%s is a %s, which cannot go in a layer",
+			hostPath, describeMode(info.Mode()))
+	}
+	data, err := os.ReadFile(hostPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	return data, info, nil
+}
+
+func describeMode(m fs.FileMode) string {
+	switch {
+	case m.IsDir():
+		return "directory"
+	case m&fs.ModeNamedPipe != 0:
+		return "named pipe"
+	case m&fs.ModeSocket != 0:
+		return "socket"
+	case m&fs.ModeDevice != 0:
+		return "device node"
+	default:
+		return "special file"
+	}
+}
+
 func buildCopyTar(files []srcFile, dest, workDir string) ([]store.TarFile, error) {
+	// Decide directory-vs-rename from what the user actually wrote, BEFORE
+	// joining WORKDIR. filepath.Join strips a trailing slash, so joining first
+	// erased the single character that distinguishes "COPY x bin/" from
+	// "COPY x bin": with a WORKDIR set, `COPY main.sh bin/` silently put the
+	// script at /work/bin as a file instead of /work/bin/main.sh.
+	//
+	// A source that came from walking a directory is directory-style too, even
+	// when the walk found exactly one file. Keying that off len(files) alone
+	// meant adding a second file to a source directory moved where the first
+	// one landed.
+	destIsDir := strings.HasSuffix(dest, "/") ||
+		len(files) > 1 ||
+		(len(files) == 1 && strings.Contains(filepath.ToSlash(files[0].RelPath), "/"))
+
 	if !filepath.IsAbs(dest) && workDir != "" {
 		dest = filepath.Join(workDir, dest)
 	}
@@ -505,17 +585,10 @@ func buildCopyTar(files []srcFile, dest, workDir string) ([]store.TarFile, error
 	var tarFiles []store.TarFile
 	destDirs := make(map[string]bool)
 
-	// Determine if dest is a directory-style path (ends in /) or a rename.
-	destIsDir := strings.HasSuffix(dest, "/") || len(files) > 1
-
 	for _, sf := range files {
-		data, err := os.ReadFile(sf.HostPath)
+		data, info, err := readCopySource(sf.HostPath)
 		if err != nil {
-			return nil, err
-		}
-		info, err := os.Stat(sf.HostPath)
-		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("COPY %s: %w", sf.RelPath, err)
 		}
 
 		var archivePath string
@@ -531,7 +604,7 @@ func buildCopyTar(files []srcFile, dest, workDir string) ([]store.TarFile, error
 
 		tarFiles = append(tarFiles, store.TarFile{
 			Path:    archivePath,
-			Mode:    int64(info.Mode()),
+			Mode:    store.TarMode(info.Mode()),
 			IsDir:   false,
 			Content: data,
 		})
@@ -556,7 +629,7 @@ func addParentDirs(archivePath string, tarFiles *[]store.TarFile, seen map[strin
 	parts := strings.Split(strings.TrimPrefix(dir, "/"), "/")
 	for i := range parts {
 		d := strings.Join(parts[:i+1], "/")
-		if existing[d] == dirSig {
+		if strings.HasPrefix(existing[d], dirSig) {
 			continue
 		}
 		if !seen[d] {
@@ -593,9 +666,14 @@ const (
 )
 
 // entrySignature summarises a filesystem entry as a comparable string encoding
-// both its kind and its content, without ever following a symlink.
+// its kind, its permissions and its content, without ever following a symlink.
 //
-// Kind has to be part of it. The delta is computed by comparing the
+// Mode has to be part of it. `RUN chmod +x /app/entrypoint.sh` changes no
+// bytes, so a content-only comparison produced an empty delta: the build
+// reported a cache miss, wrote a layer that did nothing, and the container
+// failed at runtime with "permission denied" and no diagnostic anywhere.
+//
+// Kind has to be part of it too. The delta is computed by comparing the
 // post-execution rootfs against a re-extraction of the base layers, and a
 // content-only comparison cannot see a RUN that replaced a file with a
 // directory, or a directory with a symlink — cases where writing the new entry
@@ -611,22 +689,34 @@ const (
 // reading blocks until a writer appears, which inside a build is never, so the
 // build hangs with no timeout and no diagnostic.
 func entrySignature(path string, d fs.DirEntry) (string, error) {
-	switch {
-	case d.IsDir():
-		return dirSig, nil
-	case d.Type()&fs.ModeSymlink != 0:
+	// Symlinks are excluded from the mode comparison on purpose: Linux ignores
+	// a symlink's own permission bits, and lchown/lchmod semantics differ
+	// enough between filesystems that folding them in would produce spurious
+	// deltas for links that are identical in every way that matters.
+	if d.Type()&fs.ModeSymlink != 0 {
 		target, err := os.Readlink(path)
 		if err != nil {
 			return "", err
 		}
 		return symlinkSig + target, nil
+	}
+
+	info, err := d.Info()
+	if err != nil {
+		return "", err
+	}
+	mode := store.TarMode(info.Mode())
+
+	switch {
+	case d.IsDir():
+		return fmt.Sprintf("%s%04o", dirSig, mode), nil
 	case d.Type().IsRegular():
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return "", err
 		}
 		h := sha256.Sum256(data)
-		return regularSig + hex.EncodeToString(h[:]), nil
+		return fmt.Sprintf("%s%04o:%s", regularSig, mode, hex.EncodeToString(h[:])), nil
 	default:
 		return otherSig, nil
 	}
@@ -705,7 +795,7 @@ func snapshotDelta(rootfs string, baseLayers []image.LayerEntry, st *store.State
 		info, _ := d.Info()
 		mode := int64(0644)
 		if info != nil {
-			mode = int64(info.Mode().Perm())
+			mode = store.TarMode(info.Mode())
 		}
 
 		switch {

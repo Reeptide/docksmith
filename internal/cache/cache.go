@@ -173,9 +173,11 @@ type KeyParams struct {
 //
 //	v2: whiteout entries added for deleted paths.
 //	v3: RUN deltas record symlinks as symlinks rather than copying their
-//	    targets, skip FIFOs and device nodes, whiteout entries whose kind
-//	    changed, and store permission bits only.
-const keyFormatVersion = "v3"
+//	    targets, skip FIFOs and device nodes, and whiteout entries whose kind
+//	    changed.
+//	v4: RUN deltas compare permissions as well as content, so a chmod-only
+//	    step produces a layer; setuid/setgid/sticky survive a round trip.
+const keyFormatVersion = "v4"
 
 // ComputeKey produces a deterministic cache key from KeyParams.
 func ComputeKey(p KeyParams) string {

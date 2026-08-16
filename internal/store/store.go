@@ -171,6 +171,42 @@ func IsWhiteout(name string) (target string, ok bool) {
 	return strings.TrimPrefix(dir+shadowed, "/"), true
 }
 
+// TarMode converts a Go FileMode to the permission bits a tar header carries.
+//
+// os.FileMode keeps setuid, setgid and sticky outside Perm(), in bits that do
+// not match the Unix layout, so neither Perm() nor a raw int64 conversion is
+// right. Dropping them is not cosmetic: a base image's busybox is frequently
+// setuid, and /tmp is sticky, and a layer that silently clears either changes
+// what the image can do.
+func TarMode(m os.FileMode) int64 {
+	out := int64(m.Perm())
+	if m&os.ModeSetuid != 0 {
+		out |= 04000
+	}
+	if m&os.ModeSetgid != 0 {
+		out |= 02000
+	}
+	if m&os.ModeSticky != 0 {
+		out |= 01000
+	}
+	return out
+}
+
+// FileMode is the inverse of TarMode.
+func FileMode(mode int64) os.FileMode {
+	out := os.FileMode(mode).Perm()
+	if mode&04000 != 0 {
+		out |= os.ModeSetuid
+	}
+	if mode&02000 != 0 {
+		out |= os.ModeSetgid
+	}
+	if mode&01000 != 0 {
+		out |= os.ModeSticky
+	}
+	return out
+}
+
 type TarFile struct {
 	Path      string
 	Mode      int64
@@ -279,7 +315,7 @@ func ExtractTar(data []byte, destDir string) error {
 		if err != nil {
 			return err
 		}
-		mode := os.FileMode(hdr.Mode).Perm()
+		mode := FileMode(hdr.Mode)
 
 		switch hdr.Typeflag {
 		case tar.TypeDir:

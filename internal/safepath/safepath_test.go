@@ -17,10 +17,33 @@ func TestResolveRejectsTraversalThroughASymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, rel := range []string{"evil/passwd", "evil", "../escape", "a/../../escape"} {
-		if got, err := Resolve(root, rel); err == nil && !strings.HasPrefix(got, root) {
-			t.Errorf("Resolve(%q) = %q, which is outside %s", rel, got, root)
+	// Assert on where a write LANDS, not on what the returned string looks
+	// like. An unsafe Resolve reduced to filepath.Join(root, Clean("/"+rel)) --
+	// exactly the implementation this package's doc comment calls insufficient
+	// -- returns a path that still has root as a prefix for every input here,
+	// while the write goes to the host. A prefix check on the string therefore
+	// passes against a completely broken implementation.
+	for _, rel := range []string{"evil/passwd", "../escape", "a/../../escape"} {
+		got, err := Resolve(root, rel)
+		if err != nil {
+			continue // refused outright, which is the other acceptable answer
 		}
+		if err := os.WriteFile(got, []byte("pwned"), 0600); err != nil {
+			continue
+		}
+		t.Cleanup(func() { os.Remove(got) })
+		if _, err := os.Stat(filepath.Join(outside, filepath.Base(got))); err == nil {
+			t.Errorf("Resolve(%q) = %q: the write landed outside %s", rel, got, root)
+		}
+		if !strings.HasPrefix(got, mustEval(t, root)) {
+			t.Errorf("Resolve(%q) = %q, outside %s", rel, got, root)
+		}
+	}
+
+	// "evil" itself is a different case: naming the link is legal, and Resolve
+	// follows it, so the result must be refused rather than handed back.
+	if got, err := Resolve(root, "evil"); err == nil {
+		t.Errorf("Resolve(evil) = %q, want a refusal: it resolves outside the root", got)
 	}
 }
 

@@ -2,6 +2,7 @@ package image
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -67,8 +68,18 @@ func Finalize(m *Manifest) error {
 // archives during `docksmith load`, so an unsanitised tag of "../../etc/x"
 // would make filepath.Join escape the images directory entirely and write
 // wherever the archive asked. Anything outside the safe set becomes "_".
+//
+// Sanitising alone is not injective, which matters as much as the traversal it
+// prevents. ValidRef allows "/" in a name, so "team/app:v1", "team_app:v1" and
+// "team:app_v1" all flatten to team_app_v1.json — one image would overwrite
+// another's manifest, and `rmi` on either would garbage-collect the other's
+// layers. Worse, `docksmith load` of an untrusted archive could clobber a local
+// image simply by choosing a reference that flattens to the same name. A digest
+// of the exact reference disambiguates while keeping the readable prefix.
 func ManifestFileName(name, tag string) string {
-	return fmt.Sprintf("%s_%s.json", sanitiseRef(name), sanitiseRef(tag))
+	h := sha256.Sum256([]byte(name + "\x00" + tag))
+	return fmt.Sprintf("%s_%s_%s.json", sanitiseRef(name), sanitiseRef(tag),
+		hex.EncodeToString(h[:4]))
 }
 
 // sanitiseRef reduces a name or tag to characters that cannot traverse or

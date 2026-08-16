@@ -29,7 +29,11 @@ func stateRoot() string {
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "/tmp/.docksmith"
+		// Not /tmp: this process is usually root, and a world-writable parent
+		// is somewhere another user can plant a symlink and have docksmith
+		// follow it as root. /var/lib is the conventional place for state a
+		// privileged tool owns, and it is root-only.
+		return "/var/lib/docksmith"
 	}
 	return filepath.Join(home, ".docksmith")
 }

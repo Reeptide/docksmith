@@ -147,19 +147,50 @@ func ExposedPort(s string) (int, string, error) {
 //
 // `-p 8080` is only meaningful when the image says what it listens on, so this
 // is where EXPOSE stops being documentation and does something.
+//
+// Two rules that were wrong when this only ever consulted exposed[0]:
+//
+// Bare ports are matched by protocol. `-p 5353/udp` against an image declaring
+// `EXPOSE 80/tcp 53/udp` must resolve to 53, not to 80 — and it must never have
+// its protocol rewritten to tcp, which silently published the wrong protocol
+// and produced a DNAT rule that could not match a single packet.
+//
+// Successive bare ports consume successive EXPOSE entries. `-p 8080 -p 9090`
+// against `EXPOSE 80 443` means 80 and 443; mapping both to 80 produced two
+// DNAT rules for the same destination, and the duplicate-host-port check in
+// parsePortArgs runs earlier so nothing caught it.
 func applyExposedDefaults(ports []network.PortMapping, exposed []string) []network.PortMapping {
 	if len(exposed) == 0 {
 		return ports
 	}
-	first, proto, err := ExposedPort(exposed[0])
-	if err != nil {
-		return ports
-	}
-	for i := range ports {
-		if ports[i].ContainerPort == 0 {
-			ports[i].ContainerPort = first
-			ports[i].Protocol = proto
+
+	// Exposed ports grouped by protocol, in declaration order.
+	byProto := make(map[string][]int)
+	for _, e := range exposed {
+		port, proto, err := ExposedPort(e)
+		if err != nil {
+			continue
 		}
+		byProto[proto] = append(byProto[proto], port)
+	}
+
+	next := make(map[string]int)
+	for i := range ports {
+		if ports[i].ContainerPort != 0 {
+			continue
+		}
+		proto := ports[i].Protocol
+		candidates := byProto[proto]
+		idx := next[proto]
+		if idx >= len(candidates) {
+			// Nothing left for this protocol. Leave ContainerPort at 0; the
+			// caller in run.go reports it as "-p N has no container port and
+			// the image declares no EXPOSE", which is accurate and beats
+			// inventing a mapping.
+			continue
+		}
+		ports[i].ContainerPort = candidates[idx]
+		next[proto] = idx + 1
 	}
 	return ports
 }

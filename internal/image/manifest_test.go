@@ -237,8 +237,39 @@ func TestManifestFileNameFlattensSlashes(t *testing.T) {
 	if strings.Contains(got, "/") {
 		t.Errorf("ManifestFileName = %q, must not contain a path separator", got)
 	}
-	if got != "registry_team_app_v1.json" {
-		t.Errorf("ManifestFileName = %q", got)
+	if !strings.HasPrefix(got, "registry_team_app_v1_") || !strings.HasSuffix(got, ".json") {
+		t.Errorf("ManifestFileName = %q, want the readable reference kept as a prefix", got)
+	}
+}
+
+// Flattening is lossy, so it cannot be the whole file name. ValidRef permits
+// "/" in a name, which means these three distinct references all sanitise to
+// the same string: without a disambiguator one image silently overwrites
+// another's manifest, `rmi` on either garbage-collects the other's layers, and
+// `docksmith load` of an untrusted archive can clobber a local image just by
+// picking a reference that collides.
+func TestManifestFileNameDoesNotCollideAcrossDistinctReferences(t *testing.T) {
+	refs := [][2]string{
+		{"team/app", "v1"},
+		{"team_app", "v1"},
+		{"team", "app_v1"},
+		{"team/app", "v-1"},
+	}
+	seen := make(map[string][2]string, len(refs))
+	for _, r := range refs {
+		got := ManifestFileName(r[0], r[1])
+		if prev, dup := seen[got]; dup {
+			t.Errorf("%v and %v both map to %s", prev, r, got)
+		}
+		seen[got] = r
+	}
+}
+
+// The name must stay a pure function of the reference, or an image saved by one
+// build is unfindable by the next.
+func TestManifestFileNameIsStable(t *testing.T) {
+	if a, b := ManifestFileName("team/app", "v1"), ManifestFileName("team/app", "v1"); a != b {
+		t.Errorf("ManifestFileName is not deterministic: %q then %q", a, b)
 	}
 }
 

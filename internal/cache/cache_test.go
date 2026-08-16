@@ -75,27 +75,27 @@ func TestComputeKeySensitiveToEveryField(t *testing.T) {
 // a different key, which is true whether or not the salt exists.
 //
 // A golden value is the only formulation that actually fails. This digest was
-// produced under keyFormatVersion "v3"; if the version changes and this value
+// produced under keyFormatVersion "v4"; if the version changes and this value
 // does not, the salt is not reaching the hash and every stale layer built by
 // older code is still being served behind a [CACHE HIT].
 //
 // Bumping keyFormatVersion is therefore expected to break this test. Recompute
 // the constant below — deliberately, as part of the bump — rather than deleting
 // the assertion.
-const goldenKeyV3 = "a4bb26109a4dcbec0fe3b5d4efe3741b4582a8ebfe153dba76935e6b013b4ae4"
+const goldenKeyV4 = "ad9915adb4a113d3706a299116b86d947b539def9240be959db82585365368a9"
 
 func TestComputeKeyIncludesFormatVersion(t *testing.T) {
 	if keyFormatVersion == "" {
 		t.Fatal("keyFormatVersion must not be empty")
 	}
-	if keyFormatVersion != "v3" {
-		t.Fatalf("keyFormatVersion is now %q: recompute goldenKeyV3 (and rename it) "+
+	if keyFormatVersion != "v4" {
+		t.Fatalf("keyFormatVersion is now %q: recompute goldenKeyV4 (and rename it) "+
 			"so the new format's keys are pinned", keyFormatVersion)
 	}
-	if got := ComputeKey(baseParams()); got != goldenKeyV3 {
+	if got := ComputeKey(baseParams()); got != goldenKeyV4 {
 		t.Errorf("ComputeKey(baseParams()) = %s\nwant %s\n"+
 			"Either the key inputs changed without a keyFormatVersion bump, or "+
-			"the version is not reaching the hash.", got, goldenKeyV3)
+			"the version is not reaching the hash.", got, goldenKeyV4)
 	}
 }
 

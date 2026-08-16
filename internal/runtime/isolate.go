@@ -157,6 +157,13 @@ func IsolatedRun(opts RunOptions) (int, error) {
 		Cloneflags: uintptr(cloneFlags),
 		// If this process dies, take the container with it rather than leaving
 		// an orphan running with no one to record its exit status.
+		// Pdeathsig is per-thread in Go: it is tied to the OS thread that
+		// called clone, and the goroutine running cmd.Start() is not locked to
+		// one. If the runtime ever retires that M the container takes a
+		// spurious SIGKILL. Go caches Ms aggressively so this is rare, and the
+		// alternative — an orphaned container whose supervisor is gone and
+		// whose exit code nothing will ever record — is worse. Known runc-era
+		// footgun; noted rather than worked around.
 		Pdeathsig: syscall.SIGKILL,
 	}
 	cmd.Stdout = orStd(opts.Stdout, os.Stdout)

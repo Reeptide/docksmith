@@ -101,6 +101,11 @@ func TestBuildTarZeroesHostMetadata(t *testing.T) {
 
 // The host umask must not change layer bytes — the same source tree built on
 // two differently-configured machines has to yield the same digest.
+//
+// BuildTar is a pure function of its argument and never touches the
+// filesystem, so this half can only ever pass; it stands as documentation.
+// TestExtractTarIgnoresHostUmask below is the half that can fail, since
+// extraction does create files and OpenFile's mode argument *is* umask-masked.
 func TestBuildTarIgnoresHostUmask(t *testing.T) {
 	old := syscall.Umask(0)
 	a, err := BuildTar(sampleFiles())
@@ -369,5 +374,90 @@ func TestEntryReplacingASymlinkDoesNotWriteThroughIt(t *testing.T) {
 	}
 	if data, _ := os.ReadFile(filepath.Join(dir, "bin/busybox")); string(data) != "original" {
 		t.Errorf("bin/busybox was overwritten through the link: %q", data)
+	}
+}
+
+// os.FileMode keeps setuid, setgid and sticky outside Perm(), in bits that do
+// not match the Unix layout, so a plain Perm() or int64 conversion drops them.
+// Both matter in a real base image: busybox is frequently setuid, and /tmp is
+// sticky. A layer that silently clears either changes what the image can do.
+func TestTarRoundTripPreservesSpecialModeBits(t *testing.T) {
+	cases := []struct {
+		name string
+		mode os.FileMode
+	}{
+		{"setuid binary", 0755 | os.ModeSetuid},
+		{"setgid binary", 0755 | os.ModeSetgid},
+		{"sticky directory", 0777 | os.ModeSticky},
+		{"plain", 0644},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := FileMode(TarMode(c.mode)); got != c.mode {
+				t.Errorf("FileMode(TarMode(%v)) = %v", c.mode, got)
+			}
+		})
+	}
+
+	dir := t.TempDir()
+	data, err := BuildTar([]TarFile{
+		{Path: "tmp/", Mode: TarMode(0777 | os.ModeSticky), IsDir: true},
+		{Path: "bin/busybox", Mode: TarMode(0755 | os.ModeSetuid), Content: []byte("x")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ExtractTar(data, dir); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(filepath.Join(dir, "tmp")); err != nil {
+		t.Fatal(err)
+	} else if info.Mode()&os.ModeSticky == 0 {
+		t.Errorf("sticky bit lost on /tmp: %v", info.Mode())
+	}
+	if info, err := os.Stat(filepath.Join(dir, "bin/busybox")); err != nil {
+		t.Fatal(err)
+	} else if info.Mode()&os.ModeSetuid == 0 {
+		t.Errorf("setuid bit lost on busybox: %v", info.Mode())
+	}
+}
+
+// The umask assertion that can actually fail. os.OpenFile and os.Mkdir mask
+// their mode argument against the process umask, so extraction under umask 077
+// would produce 0600 files and 0700 directories unless every entry is chmodded
+// explicitly afterwards. A container built on a hardened host would then ship
+// files its own non-root processes cannot read.
+func TestExtractTarIgnoresHostUmask(t *testing.T) {
+	data, err := BuildTar([]TarFile{
+		{Path: "app/", Mode: 0755, IsDir: true},
+		{Path: "app/run.sh", Mode: 0755, Content: []byte("#!/bin/sh\n")},
+		{Path: "app/data.txt", Mode: 0644, Content: []byte("x")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	old := syscall.Umask(0077)
+	defer syscall.Umask(old)
+
+	dir := t.TempDir()
+	if err := ExtractTar(data, dir); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		path string
+		want os.FileMode
+	}{
+		{"app", 0755},
+		{"app/run.sh", 0755},
+		{"app/data.txt", 0644},
+	} {
+		info, err := os.Stat(filepath.Join(dir, c.path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != c.want {
+			t.Errorf("%s = %v under umask 077, want %v", c.path, info.Mode().Perm(), c.want)
+		}
 	}
 }

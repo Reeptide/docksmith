@@ -456,3 +456,184 @@ func containsName(names []string, want string) bool {
 	}
 	return false
 }
+
+// A RUN that changes only permissions must still produce a layer.
+//
+// `RUN chmod +x /app/entrypoint.sh` changes no bytes, so a delta that compared
+// content alone came out empty: the build reported a cache miss, wrote a layer
+// that did nothing, and the container failed at runtime with "permission
+// denied" and no diagnostic anywhere in the build output.
+func TestSnapshotDeltaRecordsPermissionOnlyChanges(t *testing.T) {
+	st := newTestState(t)
+	base := []image.LayerEntry{writeBaseLayer(t, st, []store.TarFile{
+		{Path: "app/", Mode: 0755, IsDir: true},
+		{Path: "app/entrypoint.sh", Mode: 0644, Content: []byte("#!/bin/sh\necho hi\n")},
+	})}
+
+	rootfs := t.TempDir()
+	if err := extractLayers(base, st, rootfs); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(rootfs, "app/entrypoint.sh"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	delta, err := snapshotDelta(rootfs, base, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsName(tarEntryNames(t, delta), "app/entrypoint.sh") {
+		t.Fatal("a chmod-only RUN produced a layer that does not mention the file")
+	}
+
+	got := extractDelta(t, st, base, delta)
+	info, err := os.Stat(filepath.Join(got, "app/entrypoint.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0755 {
+		t.Errorf("mode after reassembly = %v, want -rwxr-xr-x", info.Mode())
+	}
+}
+
+// A directory's mode is part of its identity too: a RUN that locks down a
+// directory it inherited must not have that silently reverted.
+func TestSnapshotDeltaRecordsDirectoryPermissionChanges(t *testing.T) {
+	st := newTestState(t)
+	base := []image.LayerEntry{writeBaseLayer(t, st, []store.TarFile{
+		{Path: "secrets/", Mode: 0755, IsDir: true},
+	})}
+
+	rootfs := t.TempDir()
+	if err := extractLayers(base, st, rootfs); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(rootfs, "secrets"), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	delta, err := snapshotDelta(rootfs, base, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := extractDelta(t, st, base, delta)
+	info, err := os.Stat(filepath.Join(got, "secrets"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0700 {
+		t.Errorf("directory mode after reassembly = %v, want drwx------", info.Mode())
+	}
+}
+
+// COPY's trailing slash is the only thing distinguishing "put it in this
+// directory" from "rename it to this". filepath.Join strips it, so joining
+// WORKDIR before reading it silently turned the former into the latter.
+func TestBuildCopyTarKeepsDirectorySemanticsUnderWorkdir(t *testing.T) {
+	files := []srcFile{{HostPath: writeTemp(t, "x"), RelPath: "main.sh"}}
+
+	cases := []struct {
+		workDir, dest, want string
+	}{
+		{"", "bin/", "bin/main.sh"},
+		{"/work", "bin/", "work/bin/main.sh"},
+		{"/work", "bin", "work/bin"},
+		{"/work", "/opt/bin/", "opt/bin/main.sh"},
+	}
+	for _, c := range cases {
+		tf, err := buildCopyTar(files, c.dest, c.workDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !copyTarHas(tf, c.want) {
+			t.Errorf("WORKDIR %q, COPY main.sh %s -> %v, want %s",
+				c.workDir, c.dest, copyTarPaths(tf), c.want)
+		}
+	}
+}
+
+// Adding a second file to a source directory must not move where the first one
+// lands. Deciding on len(files) alone meant it did.
+func TestBuildCopyTarPlacementDoesNotDependOnSourceCount(t *testing.T) {
+	one := []srcFile{{HostPath: writeTemp(t, "a"), RelPath: "src/a.txt"}}
+	two := append([]srcFile{}, one...)
+	two = append(two, srcFile{HostPath: writeTemp(t, "b"), RelPath: "src/b.txt"})
+
+	tfOne, err := buildCopyTar(one, "/dest", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tfTwo, err := buildCopyTar(two, "/dest", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !copyTarHas(tfOne, "dest/src/a.txt") || !copyTarHas(tfTwo, "dest/src/a.txt") {
+		t.Errorf("a.txt landed at %v with one source and %v with two",
+			copyTarPaths(tfOne), copyTarPaths(tfTwo))
+	}
+}
+
+// A named pipe in the build context used to wedge COPY forever: os.ReadFile
+// blocks on a FIFO until a writer appears, and inside a build that is never.
+// The build hung before it even consulted the cache, so neither --no-cache nor
+// re-running helped.
+func TestCollectGlobSkipsNamedPipes(t *testing.T) {
+	ctx := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ctx, "real.txt"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(ctx, "pipe"), 0644); err != nil {
+		t.Skipf("cannot create a FIFO here: %v", err)
+	}
+
+	done := make(chan []srcFile, 1)
+	go func() {
+		files, err := collectGlob(ctx, "*", &IgnoreList{})
+		if err != nil {
+			done <- nil
+			return
+		}
+		if _, err := buildCopyTar(files, "/app/", ""); err != nil {
+			done <- nil
+			return
+		}
+		done <- files
+	}()
+
+	select {
+	case files := <-done:
+		for _, f := range files {
+			if f.RelPath == "pipe" {
+				t.Error("a FIFO was collected as a COPY source")
+			}
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("COPY blocked on a FIFO in the build context")
+	}
+}
+
+func writeTemp(t *testing.T, content string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func copyTarPaths(files []store.TarFile) []string {
+	var out []string
+	for _, f := range files {
+		out = append(out, f.Path)
+	}
+	return out
+}
+
+func copyTarHas(files []store.TarFile, want string) bool {
+	for _, f := range files {
+		if f.Path == want {
+			return true
+		}
+	}
+	return false
+}
