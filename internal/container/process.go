@@ -49,8 +49,16 @@ func (r *Record) IsAlive() bool {
 	if err != nil {
 		return false // process is gone
 	}
-	if r.StartTime != 0 && start != r.StartTime {
-		return false // pid was recycled by an unrelated process
+	// A record with no recorded start time cannot be proved to still own its
+	// pid, so it is reported dead rather than falling back to a bare pid check.
+	//
+	// The fallback was the reuse-unsafe behaviour this field exists to prevent.
+	// Being wrong in this direction costs a container reported as Exited while
+	// it is really running, which prune and rm handle. Being wrong in the other
+	// direction means `stop` sends SIGTERM, and then SIGKILL, to whatever
+	// unrelated process now holds that pid — as root.
+	if r.StartTime == 0 || start != r.StartTime {
+		return false
 	}
 	return true
 }
@@ -91,9 +99,18 @@ func (r *Record) MarkStarted(pid int) {
 	r.Pid = pid
 	r.State = StateRunning
 	r.StartedAt = time.Now().UTC().Format(time.RFC3339)
-	if st, err := ReadStartTime(pid); err == nil {
-		r.StartTime = st
+	st, err := ReadStartTime(pid)
+	if err != nil {
+		// IsAlive now treats a zero start time as "cannot verify, assume dead",
+		// so a silent failure here would make a running container invisible to
+		// ps and unstoppable. It should not happen — the caller has just cloned
+		// this pid — but if it does, say so rather than leaving the record in a
+		// state nothing can explain.
+		fmt.Fprintf(os.Stderr,
+			"docksmith: warning: cannot read start time for pid %d (%v); "+
+				"this container will be reported as exited\n", pid, err)
 	}
+	r.StartTime = st
 }
 
 // MarkExited records a finished process and its status.

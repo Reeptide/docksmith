@@ -94,6 +94,9 @@ grep -q "COPY config/settings.txt.*CACHE MISS" /tmp/demo-edit.txt \
 grep -q "RUN echo built.*CACHE MISS" /tmp/demo-edit.txt \
     && pass "cascade: later steps also miss" || fail "cascade: later steps also miss"
 
+ok "chmod on a COPY source invalidates its cache entry" \
+    sh -c 'chmod 700 "$0/src/main.sh"; ./docksmith build -t demo:1 "$0" | grep -q "COPY src/main.sh.*CACHE MISS"' "$CTX"
+
 section "4. .docksmithignore"
 inside "ignored files are not copied into the image" bridge \
     '[ -e /app/debug.log ] && echo FAILED || echo PASS'

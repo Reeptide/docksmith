@@ -55,7 +55,7 @@ The diff compares `entrySignature`, which encodes an entry's **kind and permissi
 
 `ignore.go` implements `.docksmithignore`, applied inside `collectGlob` so ignored files affect neither layer contents nor `COPY` cache keys.
 
-Cache keys (`internal/cache/cache.go`) are SHA-256 of: **a layer format version**, the previous layer digest, the instruction text, `WORKDIR`, accumulated `ENV` (sorted), and for `COPY` each source file's SHA-256 (sorted). **Bump `keyFormatVersion` whenever `BuildTar` output or `snapshotDelta`'s encoding changes for the same inputs** — without it, layers built by older code are silently reused. The bump is pinned by a golden digest in `cache_test.go`, which is *expected* to fail on a bump; recompute it deliberately rather than deleting the assertion. `EXPOSE` is deliberately *not* in the key. **Cascade rule:** one miss forces all later steps to miss.
+Cache keys (`internal/cache/cache.go`) are SHA-256 of: **a layer format version**, the previous layer digest, the instruction text, `WORKDIR`, accumulated `ENV` (sorted), and for `COPY` each source file's mode and SHA-256 (sorted). **Bump `keyFormatVersion` whenever `BuildTar` output or `snapshotDelta`'s encoding changes for the same inputs** — without it, layers built by older code are silently reused. The bump is pinned by a golden digest in `cache_test.go`, which is *expected* to fail on a bump; recompute it deliberately rather than deleting the assertion. `EXPOSE` is deliberately *not* in the key. **Cascade rule:** one miss forces all later steps to miss.
 
 ### Storage (`internal/store`, `internal/image`)
 
@@ -77,7 +77,7 @@ Manifest file names carry a short digest of the exact reference (`team_app_v1_<h
 
 ### Containers (`internal/container`)
 
-`~/.docksmith/containers/<id>/{config.json,rootfs/,container.log}`. Liveness compares **pid and `/proc/<pid>/stat` start time** — a bare pid check is reuse-unsafe and would let `stop` signal an unrelated process as root. `Reconcile` corrects records left claiming to run by a killed supervisor. Directory modes are `chmod`ed explicitly after `MkdirAll`, whose mode argument is umask-masked — root's umask is 077 on some distributions, which produced state a `sudo run` wrote and an unprivileged `ps` could not read.
+`~/.docksmith/containers/<id>/{config.json,rootfs/,container.log}`. Liveness compares **pid and `/proc/<pid>/stat` start time**, and a record with no recorded start time is reported *dead* rather than falling back to a bare pid check — a bare pid check is reuse-unsafe and would let `stop` signal an unrelated process as root. `Reconcile` corrects records left claiming to run by a killed supervisor. Directory modes are `chmod`ed explicitly after `MkdirAll`, whose mode argument is umask-masked — root's umask is 077 on some distributions, which produced state a `sudo run` wrote and an unprivileged `ps` could not read.
 
 `prune` treats `created` as live only within a 30-minute grace period. A `run` killed between `Create` and `MarkStarted` otherwise leaves a record pinned forever, holding a rootfs and an IP lease that nothing will ever release.
 
