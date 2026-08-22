@@ -169,7 +169,34 @@ out="$(./docksmith run --rm -v "$VOL:/data:ro" demo:1 \
     /bin/sh -c 'echo x > /data/blocked 2>/dev/null && echo WROTE || echo PASS' 2>/dev/null)"
 printf '%s' "$out" | grep -q PASS && pass ":ro mounts refuse writes" || fail ":ro mounts refuse writes" "$out"
 
-section "10. Container lifecycle"
+section "10. Resource limits (cgroups)"
+if [ "$(stat -f -c %T /sys/fs/cgroup 2>/dev/null)" = "cgroup2fs" ]; then
+    cid="$(./docksmith run -d -m 64m --cpus 0.5 --pids-limit 32 demo:1 /bin/sh -c 'sleep 30' 2>/dev/null)"
+    sleep 0.5
+    sid="${cid:0:12}"
+    cg="/sys/fs/cgroup/docksmith/$sid"
+    [ "$(cat "$cg/memory.max" 2>/dev/null)" = "67108864" ] && pass "memory.max reflects -m 64m" \
+        || fail "memory.max reflects -m 64m" "got: $(cat "$cg/memory.max" 2>/dev/null)"
+    [ "$(cat "$cg/cpu.max" 2>/dev/null)" = "50000 100000" ] && pass "cpu.max reflects --cpus 0.5" \
+        || fail "cpu.max reflects --cpus 0.5" "got: $(cat "$cg/cpu.max" 2>/dev/null)"
+    [ "$(cat "$cg/pids.max" 2>/dev/null)" = "32" ] && pass "pids.max reflects --pids-limit 32" \
+        || fail "pids.max reflects --pids-limit 32" "got: $(cat "$cg/pids.max" 2>/dev/null)"
+    grep -q . "$cg/cgroup.procs" 2>/dev/null && pass "container's pid is a member of its cgroup" \
+        || fail "container's pid is a member of its cgroup"
+    ./docksmith stop "$cid" >/dev/null 2>&1
+    [ ! -d "$cg" ] && pass "cgroup removed on stop" || fail "cgroup removed on stop"
+    ./docksmith rm -f "$cid" >/dev/null 2>&1
+
+    cid2="$(./docksmith run -d demo:1 /bin/sh -c 'sleep 5' 2>/dev/null)"
+    sleep 0.5
+    [ ! -d "/sys/fs/cgroup/docksmith/${cid2:0:12}" ] && pass "no cgroup created without resource flags" \
+        || fail "no cgroup created without resource flags"
+    ./docksmith rm -f "$cid2" >/dev/null 2>&1
+else
+    skip "resource limits (host has no cgroup v2)"
+fi
+
+section "11. Container lifecycle"
 cid="$(./docksmith run -d --name demo_bg demo:1 /bin/sh -c 'echo started; sleep 60' 2>/dev/null)"
 sleep 1.5
 ./docksmith ps 2>/dev/null | grep -q demo_bg && pass "detached container appears in ps" || fail "detached container appears in ps"
@@ -186,7 +213,7 @@ notok "rm refuses a running container" ./docksmith rm demo_live
 ok "rm -f removes a running container" ./docksmith rm -f demo_live
 ok "rm removes an exited container" ./docksmith rm demo_bg
 
-section "11. Networking"
+section "12. Networking"
 ok "docksmith0 bridge exists" ip link show docksmith0
 inside "container gets an address in 172.30.0.0/16" bridge \
     'ip addr show eth0 2>/dev/null | grep -q "inet 172.30." && echo PASS || echo FAILED'
@@ -205,7 +232,7 @@ inside "--net=none still has loopback" none 'ping -c1 -W1 127.0.0.1 >/dev/null 2
 inside "builds and net=none cannot reach the gateway" none \
     'ping -c1 -W1 172.30.0.1 >/dev/null 2>&1 && echo FAILED || echo PASS'
 
-section "12. Published ports"
+section "13. Published ports"
 ./docksmith run -d --name demo_port -p 18080:8080 demo:1 /bin/sh -c \
     'while true; do echo -e "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nit-works" | nc -l -p 8080 2>/dev/null || sleep 0.2; done' >/dev/null 2>&1
 sleep 2
@@ -232,7 +259,7 @@ sleep 0.5
 iptables -t nat -S 2>/dev/null | grep -q "dport 18080" \
     && fail "DNAT rules removed on rm" || pass "DNAT rules removed on rm"
 
-section "13. Builds have no network"
+section "14. Builds have no network"
 cat > "$CTX/netcheck" <<'EOF'
 FROM busybox:latest
 RUN ping -c1 -W1 8.8.8.8 >/dev/null 2>&1 && echo ONLINE > /net.txt || echo OFFLINE > /net.txt
@@ -244,7 +271,7 @@ out="$(./docksmith run --rm netcheck:1 2>/dev/null)"
 printf '%s' "$out" | grep -q OFFLINE && pass "RUN steps have no network access" \
     || fail "RUN steps have no network access" "got: $out"
 
-section "14. save / load"
+section "15. save / load"
 ./docksmith save -o "$ARCHIVE" demo:1 >/dev/null 2>&1
 [ -s "$ARCHIVE" ] && pass "archive written" || fail "archive written"
 tar tf "$ARCHIVE" 2>/dev/null | grep -q '^index.json$' && pass "archive has an index" || fail "archive has an index"
@@ -260,11 +287,11 @@ open('$ARCHIVE.bad','wb').write(d)" 2>/dev/null
 notok "corrupt archive is rejected" env DOCKSMITH_ROOT=/tmp/docksmith-demo-store2 ./docksmith load -i "$ARCHIVE.bad"
 rm -rf /tmp/docksmith-demo-store /tmp/docksmith-demo-store2 "$ARCHIVE" "$ARCHIVE.bad"
 
-section "15. rmi reference counting"
+section "16. rmi reference counting"
 ok "rmi removes a derived image" ./docksmith rmi netcheck:1
 ok "sibling image still runs (shared base layer survived)" ./docksmith run --rm demo:1 /bin/true
 
-section "16. prune"
+section "17. prune"
 ./docksmith run --rm demo:1 /bin/true >/dev/null 2>&1
 ./docksmith run --name demo_exited demo:1 /bin/true >/dev/null 2>&1
 out="$(./docksmith prune -f 2>&1)"
@@ -272,7 +299,7 @@ printf '%s' "$out" | grep -qE "Reclaimed|Nothing to prune" && pass "prune report
     || fail "prune reports what it reclaimed" "$out"
 ok "images still usable after prune" ./docksmith run --rm demo:1 /bin/true
 
-section "17. Unit tests"
+section "18. Unit tests"
 go test ./... >/dev/null 2>&1 && pass "go test ./..." || { fail "go test ./..."; go test ./...; }
 
 section "Cleanup"

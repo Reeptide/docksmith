@@ -7,6 +7,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"docksmith/internal/runtime"
 )
 
 func newRecord(t *testing.T, root, name string) *Record {
@@ -63,6 +65,7 @@ func TestCreateSaveLoadRoundTrip(t *testing.T) {
 	r.Env = map[string]string{"A": "1"}
 	r.ExitCode = 7
 	r.State = StateExited
+	r.Resources = &runtime.ResourceLimits{MemoryBytes: 512, CPUQuota: 1.5, PidsLimit: 100}
 	if err := Save(r); err != nil {
 		t.Fatal(err)
 	}
@@ -79,6 +82,9 @@ func TestCreateSaveLoadRoundTrip(t *testing.T) {
 	}
 	if got.Dir == "" {
 		t.Error("Dir should be populated on load")
+	}
+	if got.Resources == nil || *got.Resources != *r.Resources {
+		t.Errorf("resources lost: %+v", got.Resources)
 	}
 }
 

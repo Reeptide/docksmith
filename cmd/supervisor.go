@@ -84,12 +84,16 @@ func RunSupervisor(args []string) error {
 			if err := attachNetwork(root, rec, pid); err != nil {
 				return err
 			}
+			if err := attachCgroup(rec, pid); err != nil {
+				return err
+			}
 			rec.MarkStarted(pid)
 			return container.Save(rec)
 		},
 	})
 
 	teardownNetwork(root, rec)
+	teardownCgroup(rec)
 
 	if runErr != nil {
 		fmt.Fprintf(os.Stderr, "docksmith: %v\n", runErr)

@@ -218,6 +218,7 @@ func applyPrune(root string, st *store.State, plan prunePlan) (pruneReport, erro
 		// Release the address and iptables rules before the record naming
 		// them disappears.
 		teardownNetwork(root, r)
+		teardownCgroup(r)
 		if err := container.Remove(r); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: container %s: %v\n", container.ShortID(r.ID), err)
 			continue

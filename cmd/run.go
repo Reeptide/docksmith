@@ -32,7 +32,7 @@ func (r *repeatedFlag) Set(v string) error {
 func RunContainer(args []string) error {
 	var envArgs, volArgs, portArgs repeatedFlag
 	var detach, autoRm bool
-	var name, netMode string
+	var name, netMode, memory, cpus, pidsLimit string
 
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.Var(&envArgs, "e", "set an environment variable (KEY=VALUE), repeatable")
@@ -42,8 +42,12 @@ func RunContainer(args []string) error {
 	fs.BoolVar(&autoRm, "rm", false, "remove the container when it exits")
 	fs.StringVar(&name, "name", "", "assign a name to the container")
 	fs.StringVar(&netMode, "net", NetBridge, "network mode: bridge, none or host")
+	fs.StringVar(&memory, "memory", "", "memory limit (e.g. 512m, 1g)")
+	fs.StringVar(&memory, "m", "", "shorthand for --memory")
+	fs.StringVar(&cpus, "cpus", "", "CPU limit as a fractional core count (e.g. 1.5)")
+	fs.StringVar(&pidsLimit, "pids-limit", "", fmt.Sprintf("maximum number of processes (minimum %d; docksmith's own container init needs headroom)", runtime.MinPidsLimit))
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: docksmith run [-d] [--rm] [--name N] [--net M] [-e K=V] [-v host:ctr[:ro]] [-p host:ctr] <name:tag> [cmd [args...]]")
+		fmt.Fprintln(os.Stderr, "usage: docksmith run [-d] [--rm] [--name N] [--net M] [-e K=V] [-v host:ctr[:ro]] [-p host:ctr] [-m size] [--cpus N] [--pids-limit N] <name:tag> [cmd [args...]]")
 		fs.PrintDefaults()
 	}
 	// Parse stops at the first non-flag argument, which gives exactly the
@@ -74,6 +78,10 @@ func RunContainer(args []string) error {
 		return err
 	}
 	if err := validateNetMode(netMode, ports); err != nil {
+		return err
+	}
+	resources, err := parseResourceArgs(memory, cpus, pidsLimit)
+	if err != nil {
 		return err
 	}
 
@@ -144,6 +152,7 @@ func RunContainer(args []string) error {
 		AutoRm:     autoRm,
 		NetMode:    netMode,
 		Ports:      ports,
+		Resources:  resources,
 	}
 	if err := container.Create(root, rec); err != nil {
 		return fmt.Errorf("run: creating container: %w", err)
@@ -234,6 +243,9 @@ func runForeground(root string, rec *container.Record) error {
 			if err := attachNetwork(root, rec, pid); err != nil {
 				return err
 			}
+			if err := attachCgroup(rec, pid); err != nil {
+				return err
+			}
 			childPid.Store(int64(pid))
 			rec.MarkStarted(pid)
 			return container.Save(rec)
@@ -245,6 +257,7 @@ func runForeground(root string, rec *container.Record) error {
 	stopErr()
 
 	teardownNetwork(root, rec)
+	teardownCgroup(rec)
 
 	if runErr != nil {
 		rec.MarkExited(255)
@@ -363,4 +376,37 @@ func parseVolumeArgs(args []string) ([]runtime.Mount, error) {
 		out = append(out, m)
 	}
 	return out, nil
+}
+
+// parseResourceArgs turns the raw -m/--cpus/--pids-limit flag values into a
+// runtime.ResourceLimits, or nil if none were given — rec.Resources then
+// stays nil and no cgroup is ever created, the same nil-means-off convention
+// used for *runtime.NetworkConfig.
+func parseResourceArgs(memory, cpus, pidsLimit string) (*runtime.ResourceLimits, error) {
+	if memory == "" && cpus == "" && pidsLimit == "" {
+		return nil, nil
+	}
+	var lim runtime.ResourceLimits
+	if memory != "" {
+		b, err := runtime.ParseMemorySize(memory)
+		if err != nil {
+			return nil, fmt.Errorf("-m: %w", err)
+		}
+		lim.MemoryBytes = b
+	}
+	if cpus != "" {
+		c, err := runtime.ParseCPUs(cpus)
+		if err != nil {
+			return nil, fmt.Errorf("--cpus: %w", err)
+		}
+		lim.CPUQuota = c
+	}
+	if pidsLimit != "" {
+		n, err := runtime.ParsePidsLimit(pidsLimit)
+		if err != nil {
+			return nil, fmt.Errorf("--pids-limit: %w", err)
+		}
+		lim.PidsLimit = n
+	}
+	return &lim, nil
 }

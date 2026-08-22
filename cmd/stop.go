@@ -93,6 +93,7 @@ func stopOne(root, ref string, timeout int) error {
 // state=running and exitCode=0, destroying the exit code on every stop.
 func finishStop(root string, rec *container.Record) {
 	teardownNetwork(root, rec)
+	teardownCgroup(rec)
 
 	fresh, err := container.Load(root, rec.ID)
 	if err != nil {

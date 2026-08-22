@@ -54,6 +54,11 @@ type Record struct {
 	Rules   []network.Rule         `json:"rules,omitempty"`
 	Network *runtime.NetworkConfig `json:"network,omitempty"`
 
+	// Resources is nil unless -m/--cpus/--pids-limit were passed; it is left
+	// untouched on exit, same as Mounts and Command, since it describes what
+	// the user asked for rather than live state.
+	Resources *runtime.ResourceLimits `json:"resources,omitempty"`
+
 	State    State `json:"state"`
 	Pid      int   `json:"pid,omitempty"`
 	ExitCode int   `json:"exitCode"`

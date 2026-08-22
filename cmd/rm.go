@@ -78,6 +78,7 @@ func removeOne(root, ref string, force bool) error {
 	// Release the address lease and delete the iptables rules recorded for
 	// this container before the record that names them is gone.
 	teardownNetwork(root, rec)
+	teardownCgroup(rec)
 
 	return container.Remove(rec)
 }
